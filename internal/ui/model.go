@@ -15,7 +15,16 @@ import (
 	"github.com/maful/inline/internal/procfile"
 )
 
-const maxLogLines = 20_000
+const (
+	maxLogLines           = 20_000
+	headerHeight          = 2
+	footerHeight          = 1
+	panelTopBorderHeight  = 1
+	panelBorderHeight     = 2
+	panelHeaderHeight     = 3
+	panelVerticalChrome   = panelBorderHeight + panelHeaderHeight
+	minimumTerminalHeight = headerHeight + footerHeight + panelVerticalChrome + 1
+)
 
 var (
 	colorText    = lipgloss.AdaptiveColor{Light: "#20242c", Dark: "#d8dee9"}
@@ -169,8 +178,8 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.MouseMsg:
 		if message.Action == tea.MouseActionPress && message.Button == tea.MouseButtonLeft {
-			bodyY := message.Y - 1
-			if message.X >= 0 && message.X < m.sidebarWidth() && bodyY >= 0 && bodyY < len(m.processes) {
+			bodyY := message.Y - headerHeight - panelTopBorderHeight
+			if message.X > 0 && message.X < m.sidebarWidth()-1 && bodyY >= 0 && bodyY < len(m.processes) {
 				m.selected = bodyY
 				return m, nil
 			}
@@ -196,9 +205,9 @@ func (m Model) View() string {
 	if !m.ready || m.width == 0 || m.height == 0 {
 		return "Starting inline…"
 	}
-	if m.width < 48 || m.height < 8 {
+	if m.width < 48 || m.height < minimumTerminalHeight {
 		return lipgloss.NewStyle().Width(m.width).Height(m.height).Align(lipgloss.Center, lipgloss.Center).
-			Render("Terminal is too small\nResize to at least 48x8")
+			Render(fmt.Sprintf("Terminal is too small\nResize to at least 48x%d", minimumTerminalHeight))
 	}
 
 	header := m.renderHeader()
@@ -232,10 +241,10 @@ func (m *Model) resize() {
 	if len(m.processes) == 0 {
 		return
 	}
-	bodyHeight := max(1, m.height-2)
+	bodyHeight := m.bodyHeight()
 	mainWidth := max(1, m.width-m.sidebarWidth()-1)
 	viewportWidth := max(1, mainWidth-4)
-	viewportHeight := max(1, bodyHeight-5)
+	viewportHeight := max(1, bodyHeight-panelVerticalChrome)
 	for index := range m.processes {
 		item := &m.processes[index]
 		widthChanged := item.viewport.Width != viewportWidth
@@ -268,16 +277,17 @@ func wrapLogLine(line string, width int) string {
 func (m Model) renderHeader() string {
 	name := titleStyle.Render("inline")
 	file := mutedStyle.Render(" · " + filepath.Base(m.path))
-	return lipgloss.NewStyle().Width(m.width).MaxHeight(1).Render(" " + name + file)
+	return lipgloss.NewStyle().Width(m.width).Height(headerHeight).Render(" " + name + file)
 }
 
 func (m Model) renderSidebar() string {
 	width := m.sidebarWidth()
-	height := max(1, m.height-2)
+	height := m.bodyHeight()
+	innerWidth := max(1, width-panelBorderHeight)
 	rows := make([]string, 0, len(m.processes))
 	for index, item := range m.processes {
 		marker, markerStyle := stateMarker(item.state)
-		style := lipgloss.NewStyle().Width(width).MaxWidth(width)
+		style := lipgloss.NewStyle().Width(innerWidth).MaxWidth(innerWidth)
 		if index == m.selected {
 			// Keep the selected label plain before applying its background. A nested
 			// marker style emits an ANSI reset that would punch a hole in the row.
@@ -290,7 +300,10 @@ func (m Model) renderSidebar() string {
 			rows = append(rows, style.Render(label))
 		}
 	}
-	return lipgloss.NewStyle().Width(width).Height(height).Render(strings.Join(rows, "\n"))
+	return panelStyle.
+		Width(innerWidth).
+		Height(max(1, height-panelBorderHeight)).
+		Render(strings.Join(rows, "\n"))
 }
 
 func (m Model) renderPanel() string {
@@ -345,6 +358,10 @@ func (m Model) sidebarWidth() int {
 		return 18
 	}
 	return min(26, max(18, m.width/4))
+}
+
+func (m Model) bodyHeight() int {
+	return max(1, m.height-headerHeight-footerHeight)
 }
 
 func stateMarker(state process.State) (string, lipgloss.Style) {
