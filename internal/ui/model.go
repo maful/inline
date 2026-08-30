@@ -64,13 +64,14 @@ type Model struct {
 	source           processSource
 	path             string
 	workingDirectory string
+	version          string
 	selected         int
 	width            int
 	height           int
 	ready            bool
 }
 
-func New(definitions []procfile.Process, source processSource, path, workingDirectory string) Model {
+func New(definitions []procfile.Process, source processSource, path, workingDirectory, version string) Model {
 	views := make([]processView, len(definitions))
 	for index, definition := range definitions {
 		view := viewport.New(0, 0)
@@ -82,7 +83,13 @@ func New(definitions []procfile.Process, source processSource, path, workingDire
 			follow:     true,
 		}
 	}
-	return Model{processes: views, source: source, path: path, workingDirectory: workingDirectory}
+	return Model{
+		processes:        views,
+		source:           source,
+		path:             path,
+		workingDirectory: workingDirectory,
+		version:          version,
+	}
 }
 
 func (m Model) Init() tea.Cmd {
@@ -360,10 +367,21 @@ func (m Model) renderFooter() string {
 	if item.follow {
 		mode = "following"
 	}
-	left := mutedStyle.Render(" ↑/↓ process  pgup/pgdn scroll  f follow  q quit")
-	right := mutedStyle.Render(fmt.Sprintf("%s · %3.0f%% ", mode, math.Round(item.viewport.ScrollPercent()*100)))
-	space := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right))
-	return left + strings.Repeat(" ", space) + right
+	left := " ↑/↓ process · pgup/pgdn scroll · f follow · q quit"
+	right := fmt.Sprintf("%s · %s · %3.0f%% ", m.version, mode, math.Round(item.viewport.ScrollPercent()*100))
+	rightWidth := lipgloss.Width(right)
+	if rightWidth >= m.width {
+		return mutedStyle.Render(truncateLeft(right, m.width))
+	}
+
+	leftWidth := m.width - rightWidth - 1
+	if leftWidth == 0 {
+		left = ""
+	} else {
+		left = truncate(left, leftWidth)
+	}
+	space := m.width - lipgloss.Width(left) - rightWidth
+	return mutedStyle.Render(left) + strings.Repeat(" ", space) + mutedStyle.Render(right)
 }
 
 func (m Model) sidebarWidth() int {

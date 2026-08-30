@@ -70,7 +70,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 
 	supervisor := process.NewSupervisor(processes)
-	model := ui.New(processes, supervisor, *procfilePath, workingDirectory)
+	model := ui.New(processes, supervisor, *procfilePath, workingDirectory, displayVersion(currentVersion()))
 	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 
 	if _, err := program.Run(); err != nil {
@@ -128,10 +128,14 @@ func printVersion(output io.Writer, short bool) {
 		fmt.Fprintln(output, strings.TrimPrefix(value, "v"))
 		return
 	}
+	fmt.Fprintf(output, "inline %s (%s)\n", displayVersion(value), distribution)
+}
+
+func displayVersion(value string) string {
 	if value != "dev" && !strings.HasPrefix(value, "v") {
 		value = "v" + value
 	}
-	fmt.Fprintf(output, "inline %s (%s)\n", value, distribution)
+	return value
 }
 
 func currentVersion() string {
