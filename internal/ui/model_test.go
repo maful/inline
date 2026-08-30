@@ -22,7 +22,7 @@ func newTestModel() Model {
 		{Name: "web", Command: "bin/rails server"},
 		{Name: "worker", Command: "bundle exec sidekiq"},
 	}
-	return New(definitions, &fakeSource{events: make(chan process.Event)}, "Procfile", "/Users/example/project")
+	return New(definitions, &fakeSource{events: make(chan process.Event)}, "Procfile", "/Users/example/project", "v1.2.3")
 }
 
 func TestProcessNavigation(t *testing.T) {
@@ -134,7 +134,7 @@ func TestViewContainsProcessNamesAndCommand(t *testing.T) {
 	model := newTestModel()
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	view := updated.(Model).View()
-	for _, want := range []string{"inline", "web", "worker", "$ bin/rails server", "following"} {
+	for _, want := range []string{"inline", "web", "worker", "$ bin/rails server", "v1.2.3", "following"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("View() does not contain %q", want)
 		}
@@ -144,6 +144,40 @@ func TestViewContainsProcessNamesAndCommand(t *testing.T) {
 	}
 	if height := lipgloss.Height(view); height != 30 {
 		t.Errorf("View() height = %d, want 30", height)
+	}
+}
+
+func TestFooterSeparatesHelpAndShowsVersion(t *testing.T) {
+	model := newTestModel()
+	model.width = 100
+	footer := ansi.Strip(model.renderFooter())
+
+	for _, want := range []string{
+		"↑/↓ process · pgup/pgdn scroll · f follow · q quit",
+		"v1.2.3 · following · 100% ",
+	} {
+		if !strings.Contains(footer, want) {
+			t.Errorf("footer does not contain %q: %q", want, footer)
+		}
+	}
+	if width := lipgloss.Width(footer); width != model.width {
+		t.Errorf("footer width = %d, want %d", width, model.width)
+	}
+}
+
+func TestFooterTruncatesHelpWithoutOverflow(t *testing.T) {
+	model := newTestModel()
+	model.width = 60
+	footer := ansi.Strip(model.renderFooter())
+
+	if !strings.Contains(footer, "…") {
+		t.Fatalf("footer does not truncate help: %q", footer)
+	}
+	if !strings.HasSuffix(footer, "v1.2.3 · following · 100% ") {
+		t.Fatalf("footer does not preserve right-side status: %q", footer)
+	}
+	if width := lipgloss.Width(footer); width != model.width {
+		t.Errorf("footer width = %d, want %d", width, model.width)
 	}
 }
 
