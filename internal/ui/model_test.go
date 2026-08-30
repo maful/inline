@@ -6,6 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/maful/inline/internal/process"
 	"github.com/maful/inline/internal/procfile"
@@ -143,5 +144,37 @@ func TestViewContainsProcessNamesAndCommand(t *testing.T) {
 	}
 	if height := lipgloss.Height(view); height != 30 {
 		t.Errorf("View() height = %d, want 30", height)
+	}
+}
+
+func TestViewLeavesOneRowBetweenHeaderAndBody(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	lines := strings.Split(ansi.Strip(updated.(Model).View()), "\n")
+
+	if got := strings.TrimSpace(lines[1]); got != "" {
+		t.Fatalf("line below header = %q, want blank", got)
+	}
+	if got := strings.Count(lines[2], "╭"); got != 2 {
+		t.Fatalf("body does not begin with two aligned panel borders: %q", lines[2])
+	}
+	if !strings.Contains(lines[3], "web") || !strings.Contains(lines[3], "$ bin/rails server") {
+		t.Fatalf("first process and log panel content are not aligned: %q", lines[3])
+	}
+}
+
+func TestMouseSelectionAccountsForHeaderGap(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	model = updated.(Model)
+
+	updated, _ = model.Update(tea.MouseMsg{
+		X:      1,
+		Y:      headerHeight + panelTopBorderHeight + 1,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	if selected := updated.(Model).selected; selected != 1 {
+		t.Fatalf("selected = %d, want 1", selected)
 	}
 }
