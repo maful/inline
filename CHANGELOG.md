@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.0](https://github.com/maful/inline/compare/v0.3.0...v0.4.0) (2026-08-30)
+
+
+### Features
+
+* **ui:** abbreviate home directory in header ([#11](https://github.com/maful/inline/issues/11)) ([a9af5df](https://github.com/maful/inline/commit/a9af5dff2e0a17640be0d577b248b3fc0fb67f51))
+* **ui:** show active git branch in header ([#10](https://github.com/maful/inline/issues/10)) ([23c6ec9](https://github.com/maful/inline/commit/23c6ec94cfc1662b493fa3c200ff7e0a4285a1c2))
+* **ui:** show version and separate footer hints ([#8](https://github.com/maful/inline/issues/8)) ([bbb84b8](https://github.com/maful/inline/commit/bbb84b8fbc43c24779b866e2b60aeba090b2e9a2))
+
 ## [0.3.0](https://github.com/maful/inline/compare/v0.2.0...v0.3.0) (2026-08-30)
 
 
