@@ -2,16 +2,40 @@ name: Release
 
 on:
   push:
-    tags:
-      - "*"
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
   contents: write
+  issues: write
+  pull-requests: write
   id-token: write
   attestations: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  release_please:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+
+    steps:
+      - name: Create or update release pull request
+        id: release
+        uses: googleapis/release-please-action@v5
+
   release:
+    name: Publish release
+    needs: release_please
+    if: needs.release_please.outputs.release_created == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -19,6 +43,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
         with:
+          ref: ${{ needs.release_please.outputs.tag_name }}
           fetch-depth: 0
 
       - name: Set up Go
