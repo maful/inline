@@ -22,7 +22,7 @@ func newTestModel() Model {
 		{Name: "web", Command: "bin/rails server"},
 		{Name: "worker", Command: "bundle exec sidekiq"},
 	}
-	return New(definitions, &fakeSource{events: make(chan process.Event)}, "Procfile")
+	return New(definitions, &fakeSource{events: make(chan process.Event)}, "Procfile", "/Users/example/project")
 }
 
 func TestProcessNavigation(t *testing.T) {
@@ -160,6 +160,33 @@ func TestViewLeavesOneRowBetweenHeaderAndBody(t *testing.T) {
 	}
 	if !strings.Contains(lines[3], "web") || !strings.Contains(lines[3], "$ bin/rails server") {
 		t.Fatalf("first process and log panel content are not aligned: %q", lines[3])
+	}
+}
+
+func TestHeaderShowsWorkingDirectoryAtRight(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	header := strings.Split(ansi.Strip(updated.(Model).View()), "\n")[0]
+
+	if !strings.HasSuffix(header, "/Users/example/project ") {
+		t.Fatalf("header does not show the working directory at the right: %q", header)
+	}
+	if width := lipgloss.Width(header); width != 100 {
+		t.Fatalf("header width = %d, want 100", width)
+	}
+}
+
+func TestHeaderTruncatesLongWorkingDirectoryWithoutOverflow(t *testing.T) {
+	model := newTestModel()
+	model.workingDirectory = "/Users/example/a/very/long/path/to/project"
+	model.width = 48
+	header := strings.Split(ansi.Strip(model.renderHeader()), "\n")[0]
+
+	if !strings.Contains(header, "…") || !strings.HasSuffix(header, "/project ") {
+		t.Fatalf("header does not preserve the end of a long working directory: %q", header)
+	}
+	if width := lipgloss.Width(header); width != 48 {
+		t.Fatalf("header width = %d, want 48", width)
 	}
 }
 

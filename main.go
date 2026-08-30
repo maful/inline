@@ -64,9 +64,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("parse %s: %w", *procfilePath, err)
 	}
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("get working directory: %w", err)
+	}
 
 	supervisor := process.NewSupervisor(processes)
-	model := ui.New(processes, supervisor, *procfilePath)
+	model := ui.New(processes, supervisor, *procfilePath, workingDirectory)
 	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 
 	if _, err := program.Run(); err != nil {

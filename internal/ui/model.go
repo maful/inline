@@ -60,16 +60,17 @@ type processView struct {
 
 // Model is Inline's Bubble Tea application state.
 type Model struct {
-	processes []processView
-	source    processSource
-	path      string
-	selected  int
-	width     int
-	height    int
-	ready     bool
+	processes        []processView
+	source           processSource
+	path             string
+	workingDirectory string
+	selected         int
+	width            int
+	height           int
+	ready            bool
 }
 
-func New(definitions []procfile.Process, source processSource, path string) Model {
+func New(definitions []procfile.Process, source processSource, path, workingDirectory string) Model {
 	views := make([]processView, len(definitions))
 	for index, definition := range definitions {
 		view := viewport.New(0, 0)
@@ -81,7 +82,7 @@ func New(definitions []procfile.Process, source processSource, path string) Mode
 			follow:     true,
 		}
 	}
-	return Model{processes: views, source: source, path: path}
+	return Model{processes: views, source: source, path: path, workingDirectory: workingDirectory}
 }
 
 func (m Model) Init() tea.Cmd {
@@ -275,9 +276,21 @@ func wrapLogLine(line string, width int) string {
 }
 
 func (m Model) renderHeader() string {
-	name := titleStyle.Render("inline")
-	file := mutedStyle.Render(" · " + filepath.Base(m.path))
-	return lipgloss.NewStyle().Width(m.width).Height(headerHeight).Render(" " + name + file)
+	const (
+		horizontalPadding = 2
+		minimumGap        = 1
+	)
+	contentWidth := max(1, m.width-horizontalPadding)
+	leftMaxWidth := max(len("inline"), contentWidth/2)
+	file := truncate(" · "+filepath.Base(m.path), leftMaxWidth-len("inline"))
+	left := titleStyle.Render("inline") + mutedStyle.Render(file)
+
+	rightWidth := max(1, contentWidth-lipgloss.Width(left)-minimumGap)
+	right := mutedStyle.Render(truncateLeft(m.workingDirectory, rightWidth))
+	gap := max(minimumGap, m.width-horizontalPadding-lipgloss.Width(left)-lipgloss.Width(right))
+	return lipgloss.NewStyle().Height(headerHeight).Render(
+		" " + left + strings.Repeat(" ", gap) + right + " ",
+	)
 }
 
 func (m Model) renderSidebar() string {
@@ -404,4 +417,15 @@ func truncate(value string, width int) string {
 		return "…"
 	}
 	return string(runes[:width-1]) + "…"
+}
+
+func truncateLeft(value string, width int) string {
+	runes := []rune(value)
+	if len(runes) <= width {
+		return value
+	}
+	if width <= 1 {
+		return "…"
+	}
+	return "…" + string(runes[len(runes)-width+1:])
 }
