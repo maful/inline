@@ -22,7 +22,7 @@ func newTestModel() Model {
 		{Name: "web", Command: "bin/rails server"},
 		{Name: "worker", Command: "bundle exec sidekiq"},
 	}
-	return New(definitions, &fakeSource{events: make(chan process.Event)}, "Procfile", "/Users/example/project", "v1.2.3")
+	return New(definitions, &fakeSource{events: make(chan process.Event)}, "Procfile", "/Users/example/project", "main", "v1.2.3")
 }
 
 func TestProcessNavigation(t *testing.T) {
@@ -202,11 +202,39 @@ func TestHeaderShowsWorkingDirectoryAtRight(t *testing.T) {
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	header := strings.Split(ansi.Strip(updated.(Model).View()), "\n")[0]
 
-	if !strings.HasSuffix(header, "/Users/example/project ") {
-		t.Fatalf("header does not show the working directory at the right: %q", header)
+	if !strings.HasSuffix(header, "/Users/example/project · ⎇ main ") {
+		t.Fatalf("header does not show the working directory and branch at the right: %q", header)
 	}
 	if width := lipgloss.Width(header); width != 100 {
 		t.Fatalf("header width = %d, want 100", width)
+	}
+}
+
+func TestHeaderOmitsBranchOutsideGitRepository(t *testing.T) {
+	model := newTestModel()
+	model.branch = ""
+	model.width = 100
+	header := strings.Split(ansi.Strip(model.renderHeader()), "\n")[0]
+
+	if strings.Contains(header, "⎇") {
+		t.Fatalf("header shows a branch marker without a branch: %q", header)
+	}
+	if !strings.HasSuffix(header, "/Users/example/project ") {
+		t.Fatalf("header does not preserve the working directory: %q", header)
+	}
+}
+
+func TestHeaderTruncatesLongBranchWithoutOverflow(t *testing.T) {
+	model := newTestModel()
+	model.branch = "feature/a-very-long-branch-name"
+	model.width = 48
+	header := strings.Split(ansi.Strip(model.renderHeader()), "\n")[0]
+
+	if !strings.Contains(header, "⎇ feature/") || !strings.Contains(header, "…") {
+		t.Fatalf("header does not preserve the branch marker and branch prefix: %q", header)
+	}
+	if width := lipgloss.Width(header); width != 48 {
+		t.Fatalf("header width = %d, want 48", width)
 	}
 }
 
@@ -216,8 +244,8 @@ func TestHeaderTruncatesLongWorkingDirectoryWithoutOverflow(t *testing.T) {
 	model.width = 48
 	header := strings.Split(ansi.Strip(model.renderHeader()), "\n")[0]
 
-	if !strings.Contains(header, "…") || !strings.HasSuffix(header, "/project ") {
-		t.Fatalf("header does not preserve the end of a long working directory: %q", header)
+	if !strings.Contains(header, "…") || !strings.HasSuffix(header, "/project · ⎇ main ") {
+		t.Fatalf("header does not preserve the branch and end of a long working directory: %q", header)
 	}
 	if width := lipgloss.Width(header); width != 48 {
 		t.Fatalf("header width = %d, want 48", width)

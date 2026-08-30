@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"runtime/debug"
 	"strings"
 
@@ -68,9 +69,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("get working directory: %w", err)
 	}
+	branch := currentGitBranch(ctx, workingDirectory)
 
 	supervisor := process.NewSupervisor(processes)
-	model := ui.New(processes, supervisor, *procfilePath, workingDirectory, displayVersion(currentVersion()))
+	model := ui.New(processes, supervisor, *procfilePath, workingDirectory, branch, displayVersion(currentVersion()))
 	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 
 	if _, err := program.Run(); err != nil {
@@ -79,6 +81,17 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	supervisor.StopAll()
 	return nil
+}
+
+func currentGitBranch(ctx context.Context, workingDirectory string) string {
+	output, err := exec.CommandContext(
+		ctx,
+		"git", "-C", workingDirectory, "symbolic-ref", "--quiet", "--short", "HEAD",
+	).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func runVersion(args []string, stdout, stderr io.Writer) error {
