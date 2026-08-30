@@ -198,15 +198,42 @@ func TestViewLeavesOneRowBetweenHeaderAndBody(t *testing.T) {
 }
 
 func TestHeaderShowsWorkingDirectoryAtRight(t *testing.T) {
+	t.Setenv("HOME", "/Users/example")
 	model := newTestModel()
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	header := strings.Split(ansi.Strip(updated.(Model).View()), "\n")[0]
 
-	if !strings.HasSuffix(header, "/Users/example/project · ⎇ main ") {
+	if !strings.HasSuffix(header, "~/project · ⎇ main ") {
 		t.Fatalf("header does not show the working directory and branch at the right: %q", header)
+	}
+	if strings.Contains(header, "/Users/example") {
+		t.Fatalf("header exposes the home directory: %q", header)
 	}
 	if width := lipgloss.Width(header); width != 100 {
 		t.Fatalf("header width = %d, want 100", width)
+	}
+}
+
+func TestAbbreviateHomeDirectory(t *testing.T) {
+	tests := []struct {
+		name      string
+		directory string
+		home      string
+		want      string
+	}{
+		{name: "home directory", directory: "/Users/example", home: "/Users/example", want: "~"},
+		{name: "inside home directory", directory: "/Users/example/project", home: "/Users/example", want: "~/project"},
+		{name: "similar prefix", directory: "/Users/example-work/project", home: "/Users/example", want: "/Users/example-work/project"},
+		{name: "outside home directory", directory: "/opt/project", home: "/Users/example", want: "/opt/project"},
+		{name: "unknown home directory", directory: "/Users/example/project", home: "", want: "/Users/example/project"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := abbreviateHomeDirectory(test.directory, test.home); got != test.want {
+				t.Fatalf("abbreviateHomeDirectory(%q, %q) = %q, want %q", test.directory, test.home, got, test.want)
+			}
+		})
 	}
 }
 

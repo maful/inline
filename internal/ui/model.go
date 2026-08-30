@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -74,6 +75,7 @@ type Model struct {
 }
 
 func New(definitions []procfile.Process, source processSource, path, workingDirectory, branch, version string) Model {
+	homeDirectory, _ := os.UserHomeDir()
 	views := make([]processView, len(definitions))
 	for index, definition := range definitions {
 		view := viewport.New(0, 0)
@@ -89,10 +91,25 @@ func New(definitions []procfile.Process, source processSource, path, workingDire
 		processes:        views,
 		source:           source,
 		path:             path,
-		workingDirectory: workingDirectory,
+		workingDirectory: abbreviateHomeDirectory(workingDirectory, homeDirectory),
 		branch:           branch,
 		version:          version,
 	}
+}
+
+func abbreviateHomeDirectory(directory, homeDirectory string) string {
+	if homeDirectory == "" {
+		return directory
+	}
+
+	relative, err := filepath.Rel(homeDirectory, directory)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return directory
+	}
+	if relative == "." {
+		return "~"
+	}
+	return filepath.Join("~", relative)
 }
 
 func (m Model) Init() tea.Cmd {
