@@ -13,9 +13,41 @@ Procfile is supported as a first-class, drop-in configuration format—not the b
 
 ## Usage
 
+### Install a release
+
+Install the latest release on macOS or Linux:
+
+```sh
+curl -fsSL https://github.com/maful/inline/releases/latest/download/install.sh | sh
+```
+
+The installer supports Intel/AMD and ARM64 systems. It installs into `~/.local/share/inline` and links the active version at `~/.local/bin/inline`; it never requires `sudo`.
+
+To inspect the installer before running it:
+
+```sh
+curl -fsSLO https://github.com/maful/inline/releases/latest/download/install.sh
+less install.sh
+sh install.sh
+```
+
+Update a standalone installation at any time:
+
+```sh
+inline update
+```
+
+`inline upgrade` is an alias. Updates are downloaded into a new versioned directory, checked against the release SHA-256 checksum, and activated only after verification succeeds.
+
 ### Install from source
 
-Clone the repository, then install `inline` into your Go binary directory:
+Install the latest tagged version into your Go binary directory:
+
+```sh
+go install github.com/maful/inline@latest
+```
+
+Re-run that command to update a source installation. When working from a clone, install the current checkout with:
 
 ```sh
 go install .
@@ -25,6 +57,12 @@ Alternatively, build a local binary:
 
 ```sh
 go build -o inline .
+```
+
+Print the installed version and distribution channel with:
+
+```sh
+inline version
 ```
 
 ### Define your processes
@@ -111,3 +149,11 @@ go test -race ./...
 go vet ./...
 go build ./...
 ```
+
+Test the release configuration locally without publishing:
+
+```sh
+goreleaser release --snapshot --clean
+```
+
+Publishing a SemVer tag such as `v0.1.0` triggers the release workflow. It tests the repository, creates macOS and Linux archives for AMD64 and ARM64, publishes their checksums and `install.sh` to GitHub Releases, and attests the archives.

@@ -1,0 +1,45 @@
+version: 2
+
+project_name: inline
+
+builds:
+  - id: inline
+    main: .
+    binary: inline
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{ .Version }} -X main.distribution=standalone
+
+archives:
+  - ids:
+      - inline
+    formats:
+      - tar.gz
+    name_template: inline_{{ .Os }}_{{ .Arch }}
+    files:
+      - none*
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+
+release:
+  prerelease: auto
+  extra_files:
+    - glob: ./install.sh

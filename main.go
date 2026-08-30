@@ -1,30 +1,68 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"runtime/debug"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/maful/inline/internal/process"
 	"github.com/maful/inline/internal/procfile"
 	"github.com/maful/inline/internal/ui"
+	"github.com/maful/inline/internal/updater"
+)
+
+var (
+	version      = "dev"
+	distribution = "source"
 )
 
 func main() {
-	procfilePath := flag.String("f", "Procfile", "path to a Procfile")
-	flag.Parse()
+	if err := run(context.Background(), os.Args[1:], os.Stdout, os.Stderr); err != nil {
+		fatal("%v", err)
+	}
+}
+
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "version":
+			return runVersion(args[1:], stdout, stderr)
+		case "update", "upgrade":
+			return runUpdate(ctx, args[1:], stdout, stderr)
+		case "--version":
+			if len(args) != 1 {
+				return fmt.Errorf("--version does not accept arguments")
+			}
+			printVersion(stdout, false)
+			return nil
+		}
+	}
+
+	flags := flag.NewFlagSet("inline", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	procfilePath := flags.String("f", "Procfile", "path to a Procfile")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
 
 	file, err := os.Open(*procfilePath)
 	if err != nil {
-		fatal("open %s: %v", *procfilePath, err)
+		return fmt.Errorf("open %s: %w", *procfilePath, err)
 	}
 	defer file.Close()
 
 	processes, err := procfile.Parse(file)
 	if err != nil {
-		fatal("parse %s: %v", *procfilePath, err)
+		return fmt.Errorf("parse %s: %w", *procfilePath, err)
 	}
 
 	supervisor := process.NewSupervisor(processes)
@@ -33,9 +71,74 @@ func main() {
 
 	if _, err := program.Run(); err != nil {
 		supervisor.StopAll()
-		fatal("run inline: %v", err)
+		return fmt.Errorf("run inline: %w", err)
 	}
 	supervisor.StopAll()
+	return nil
+}
+
+func runVersion(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("inline version", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	short := flags.Bool("short", false, "print only the version number")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("version: unexpected argument %q", flags.Arg(0))
+	}
+	printVersion(stdout, *short)
+	return nil
+}
+
+func runUpdate(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("inline update", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("update: unexpected argument %q", flags.Arg(0))
+	}
+
+	switch distribution {
+	case "standalone":
+		return updater.Update(ctx, updater.Options{
+			CurrentVersion: currentVersion(),
+			Stdout:         stdout,
+		})
+	case "homebrew":
+		fmt.Fprintln(stdout, "Inline is managed by Homebrew. Run: brew upgrade inline")
+		return nil
+	case "source":
+		fmt.Fprintln(stdout, "Inline was installed from source. Run: go install github.com/maful/inline@latest")
+		return nil
+	default:
+		return fmt.Errorf("updates are not supported for distribution %q", distribution)
+	}
+}
+
+func printVersion(output io.Writer, short bool) {
+	value := currentVersion()
+	if short {
+		fmt.Fprintln(output, strings.TrimPrefix(value, "v"))
+		return
+	}
+	if value != "dev" && !strings.HasPrefix(value, "v") {
+		value = "v" + value
+	}
+	fmt.Fprintf(output, "inline %s (%s)\n", value, distribution)
+}
+
+func currentVersion() string {
+	if version != "dev" {
+		return version
+	}
+	info, ok := debug.ReadBuildInfo()
+	if ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return version
 }
 
 func fatal(format string, args ...any) {
