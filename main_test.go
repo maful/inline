@@ -3,9 +3,25 @@ package main
 import (
 	"bytes"
 	"context"
+	"os/exec"
 	"strings"
 	"testing"
 )
+
+func TestCurrentGitBranch(t *testing.T) {
+	repository := t.TempDir()
+	command := exec.Command("git", "init", "--initial-branch", "feature/header", repository)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("initialize test repository: %v: %s", err, output)
+	}
+
+	if got, want := currentGitBranch(context.Background(), repository), "feature/header"; got != want {
+		t.Fatalf("currentGitBranch() = %q, want %q", got, want)
+	}
+	if got := currentGitBranch(context.Background(), t.TempDir()); got != "" {
+		t.Fatalf("currentGitBranch() outside repository = %q, want empty", got)
+	}
+}
 
 func TestVersionCommand(t *testing.T) {
 	originalVersion := version

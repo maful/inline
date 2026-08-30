@@ -38,6 +38,7 @@ var (
 	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(colorPrimary)
 	mutedStyle   = lipgloss.NewStyle().Foreground(colorMuted)
 	commandStyle = lipgloss.NewStyle().Foreground(colorMuted)
+	branchStyle  = lipgloss.NewStyle().Foreground(colorBorder)
 	panelStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorBorder)
 	activeStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#ffffff")).Background(colorPrimary).Bold(true)
 	errorStyle   = lipgloss.NewStyle().Foreground(colorError)
@@ -64,6 +65,7 @@ type Model struct {
 	source           processSource
 	path             string
 	workingDirectory string
+	branch           string
 	version          string
 	selected         int
 	width            int
@@ -71,7 +73,7 @@ type Model struct {
 	ready            bool
 }
 
-func New(definitions []procfile.Process, source processSource, path, workingDirectory, version string) Model {
+func New(definitions []procfile.Process, source processSource, path, workingDirectory, branch, version string) Model {
 	views := make([]processView, len(definitions))
 	for index, definition := range definitions {
 		view := viewport.New(0, 0)
@@ -88,6 +90,7 @@ func New(definitions []procfile.Process, source processSource, path, workingDire
 		source:           source,
 		path:             path,
 		workingDirectory: workingDirectory,
+		branch:           branch,
 		version:          version,
 	}
 }
@@ -293,11 +296,34 @@ func (m Model) renderHeader() string {
 	left := titleStyle.Render("inline") + mutedStyle.Render(file)
 
 	rightWidth := max(1, contentWidth-lipgloss.Width(left)-minimumGap)
-	right := mutedStyle.Render(truncateLeft(m.workingDirectory, rightWidth))
+	right := m.renderHeaderRight(rightWidth)
 	gap := max(minimumGap, m.width-horizontalPadding-lipgloss.Width(left)-lipgloss.Width(right))
 	return lipgloss.NewStyle().Height(headerHeight).Render(
 		" " + left + strings.Repeat(" ", gap) + right + " ",
 	)
+}
+
+func (m Model) renderHeaderRight(width int) string {
+	if m.branch == "" {
+		return mutedStyle.Render(truncateLeft(m.workingDirectory, width))
+	}
+
+	const (
+		separator = " · "
+		marker    = "⎇ "
+	)
+	branchWidth := width - lipgloss.Width(marker)
+	if branchWidth <= 0 {
+		return branchStyle.Render(truncate(marker, width))
+	}
+	branch := marker + truncate(m.branch, branchWidth)
+	if lipgloss.Width(branch)+lipgloss.Width(separator) >= width {
+		return branchStyle.Render(branch)
+	}
+
+	directoryWidth := width - lipgloss.Width(separator) - lipgloss.Width(branch)
+	directory := truncateLeft(m.workingDirectory, directoryWidth)
+	return mutedStyle.Render(directory+separator) + branchStyle.Render(branch)
 }
 
 func (m Model) renderSidebar() string {
