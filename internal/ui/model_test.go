@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -47,10 +48,10 @@ func TestEventAppearsOnlyInItsProcess(t *testing.T) {
 	updated, _ = model.Update(process.Event{Index: 1, Line: "sidekiq ready", State: process.Running, PID: 4242})
 	model = updated.(Model)
 
-	if len(model.processes[0].lines) != 0 {
-		t.Fatalf("web lines = %v, want none", model.processes[0].lines)
+	if model.processes[0].logs.count() != 0 {
+		t.Fatalf("web lines = %v, want none", model.processes[0].logs.visibleLines())
 	}
-	if got := strings.Join(model.processes[1].lines, "\n"); got != "sidekiq ready" {
+	if got := strings.Join(model.processes[1].logs.visibleLines(), "\n"); got != "sidekiq ready" {
 		t.Fatalf("worker lines = %q", got)
 	}
 	if !model.processes[1].follow || !model.processes[1].viewport.AtBottom() {
@@ -90,6 +91,101 @@ func TestStatusShowsReceivedLineCount(t *testing.T) {
 	}
 	if strings.Contains(view, "waiting for output") {
 		t.Fatalf("View() still says waiting after receiving output:\n%s", view)
+	}
+}
+
+func TestFiltersAreLiveAndIndependentPerProcess(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	model = updated.(Model)
+	for _, event := range []process.Event{
+		{Index: 0, Line: "web ready"},
+		{Index: 0, Line: "web ERROR timeout"},
+		{Index: 1, Line: "worker ready"},
+		{Index: 1, Line: "worker retry"},
+	} {
+		updated, _ = model.Update(event)
+		model = updated.(Model)
+	}
+
+	updated, _ = model.Update(keyRunes("/"))
+	model = updated.(Model)
+	updated, _ = model.Update(keyRunes("error"))
+	model = updated.(Model)
+	if got, want := model.processes[0].logs.visibleLines(), []string{"web ERROR timeout"}; !slices.Equal(got, want) {
+		t.Fatalf("web visible lines = %v, want %v", got, want)
+	}
+	if !strings.Contains(model.View(), "web ERROR timeout") || strings.Contains(model.View(), "web ready") {
+		t.Fatalf("web filter was not previewed live:\n%s", model.View())
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(Model)
+	updated, _ = model.Update(keyRunes("/"))
+	model = updated.(Model)
+	updated, _ = model.Update(keyRunes("ready"))
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+
+	if got := model.processes[0].logs.query; got != "error" {
+		t.Fatalf("web query = %q, want error", got)
+	}
+	if got := model.processes[1].logs.query; got != "ready" {
+		t.Fatalf("worker query = %q, want ready", got)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyUp})
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if got := model.processes[0].logs.visibleCount(); got != 2 {
+		t.Fatalf("web visible count after clearing = %d, want 2", got)
+	}
+	if got := model.processes[1].logs.query; got != "ready" {
+		t.Fatalf("clearing web filter changed worker query to %q", got)
+	}
+}
+
+func TestEscapeCancelsFilterEdit(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	model = updated.(Model)
+	model.processes[0].logs.setQuery("error")
+
+	updated, _ = model.Update(keyRunes("/"))
+	model = updated.(Model)
+	updated, _ = model.Update(keyRunes(" timeout"))
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+
+	if got := model.processes[0].logs.query; got != "error" {
+		t.Fatalf("query after cancel = %q, want error", got)
+	}
+	if model.filterEditing {
+		t.Fatal("filter remains in editing mode after escape")
+	}
+}
+
+func TestFilteredViewExplainsNoMatches(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	model = updated.(Model)
+	updated, _ = model.Update(process.Event{Index: 0, State: process.Running, Line: "server ready"})
+	model = updated.(Model)
+	model.processes[0].logs.setQuery("error")
+	model.processes[0].dirty = true
+	model.refreshSelected()
+
+	view := model.View()
+	if !strings.Contains(view, `0/1 lines · filter: "error"`) {
+		t.Fatalf("view does not show match count and filter:\n%s", view)
+	}
+	if !strings.Contains(view, `No lines match "error". 1 line retained.`) {
+		t.Fatalf("view does not explain empty filtered output:\n%s", view)
 	}
 }
 
@@ -153,7 +249,7 @@ func TestFooterSeparatesHelpAndShowsVersion(t *testing.T) {
 	footer := ansi.Strip(model.renderFooter())
 
 	for _, want := range []string{
-		"↑/↓ process · pgup/pgdn scroll · f follow · q quit",
+		"↑/↓ process · / filter · pgup/pgdn scroll · f follow · q quit",
 		"v1.2.3 · following · 100% ",
 	} {
 		if !strings.Contains(footer, want) {
@@ -293,4 +389,8 @@ func TestMouseSelectionAccountsForHeaderGap(t *testing.T) {
 	if selected := updated.(Model).selected; selected != 1 {
 		t.Fatalf("selected = %d, want 1", selected)
 	}
+}
+
+func keyRunes(value string) tea.KeyMsg {
+	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(value)}
 }
