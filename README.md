@@ -111,9 +111,14 @@ go run . -f Procfile.dev
 | `g` / `Home` | Jump to the top and pause following |
 | `G` / `End` | Jump to the bottom and resume following |
 | `f` | Toggle automatic bottom-follow |
+| `/` | Edit the selected process's log filter |
+| `Enter` / `Esc` | Apply or cancel a filter edit |
+| `Esc` | Clear the selected process's applied filter |
 | `q`, `Ctrl+C` | Stop every process and quit |
 
 Each pane shows the process state, PID, and number of captured lines. Long output wraps to the pane width and reflows when the terminal is resized.
+
+Filters are case-insensitive literal searches and are kept separately for each process. Filtering only changes the visible lines: Inline retains the complete 20,000-line scrollback, so clearing or changing a filter restores earlier output. ANSI color codes are ignored while matching and preserved when matching lines are displayed.
 
 ### Shell commands and output
 

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -25,6 +26,7 @@ const (
 	panelHeaderHeight     = 3
 	panelVerticalChrome   = panelBorderHeight + panelHeaderHeight
 	minimumTerminalHeight = headerHeight + footerHeight + panelVerticalChrome + 1
+	maxEventBatch         = 256
 )
 
 var (
@@ -53,11 +55,12 @@ type processSource interface {
 type processView struct {
 	definition procfile.Process
 	viewport   viewport.Model
-	lines      []string
+	logs       logBuffer
 	rendered   []string
 	state      process.State
 	pid        int
 	follow     bool
+	dirty      bool
 }
 
 // Model is Inline's Bubble Tea application state.
@@ -72,10 +75,18 @@ type Model struct {
 	width            int
 	height           int
 	ready            bool
+	filterInput      textinput.Model
+	filterEditing    bool
+	filterProcess    int
+	filterOriginal   string
 }
 
 func New(definitions []procfile.Process, source processSource, path, workingDirectory, branch, version string) Model {
 	homeDirectory, _ := os.UserHomeDir()
+	filterInput := textinput.New()
+	filterInput.Prompt = "/ "
+	filterInput.Placeholder = "filter logs"
+	filterInput.CharLimit = 256
 	views := make([]processView, len(definitions))
 	for index, definition := range definitions {
 		view := viewport.New(0, 0)
@@ -83,8 +94,10 @@ func New(definitions []procfile.Process, source processSource, path, workingDire
 		views[index] = processView{
 			definition: definition,
 			viewport:   view,
+			logs:       newLogBuffer(maxLogLines),
 			state:      process.Starting,
 			follow:     true,
+			dirty:      true,
 		}
 	}
 	return Model{
@@ -94,6 +107,8 @@ func New(definitions []procfile.Process, source processSource, path, workingDire
 		workingDirectory: abbreviateHomeDirectory(workingDirectory, homeDirectory),
 		branch:           branch,
 		version:          version,
+		filterInput:      filterInput,
+		filterProcess:    -1,
 	}
 }
 
@@ -122,8 +137,28 @@ func (m Model) Init() tea.Cmd {
 	)
 }
 
+type processEventBatch []process.Event
+
 func waitForEvent(events <-chan process.Event) tea.Cmd {
-	return func() tea.Msg { return <-events }
+	return func() tea.Msg {
+		first, ok := <-events
+		if !ok {
+			return nil
+		}
+		batch := processEventBatch{first}
+		for len(batch) < maxEventBatch {
+			select {
+			case event, open := <-events:
+				if !open {
+					return batch
+				}
+				batch = append(batch, event)
+			default:
+				return batch
+			}
+		}
+		return batch
+	}
 }
 
 func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -136,38 +171,52 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case process.Event:
-		if message.Index >= 0 && message.Index < len(m.processes) {
-			item := &m.processes[message.Index]
-			if message.State != "" {
-				item.state = message.State
-			}
-			if message.PID > 0 {
-				item.pid = message.PID
-			}
-			if message.Line != "" {
-				m.appendLine(item, message.Line)
-			}
-			if message.Err != nil {
-				m.appendLine(item, errorStyle.Render("inline: "+message.Err.Error()))
-			}
+		m.applyEvent(message)
+		m.refreshSelected()
+		return m, waitForEvent(m.source.Events())
+
+	case processEventBatch:
+		for _, event := range message {
+			m.applyEvent(event)
 		}
+		m.refreshSelected()
 		return m, waitForEvent(m.source.Events())
 
 	case tea.KeyMsg:
-		switch message.String() {
-		case "q", "ctrl+c":
+		if message.String() == "ctrl+c" {
 			return m, tea.Quit
+		}
+		if m.filterEditing {
+			return m.updateFilterInput(message)
+		}
+
+		switch message.String() {
+		case "q":
+			return m, tea.Quit
+		case "/":
+			return m, m.beginFilter()
+		case "esc":
+			item := &m.processes[m.selected]
+			if item.logs.setQuery("") {
+				item.dirty = true
+				m.refreshSelected()
+			}
+			return m, nil
 		case "tab", "right", "l":
 			m.selectRelative(1)
+			m.refreshSelected()
 			return m, nil
 		case "shift+tab", "left", "h":
 			m.selectRelative(-1)
+			m.refreshSelected()
 			return m, nil
 		case "down", "j":
 			m.selectRelative(1)
+			m.refreshSelected()
 			return m, nil
 		case "up", "k":
 			m.selectRelative(-1)
+			m.refreshSelected()
 			return m, nil
 		case "end", "G":
 			item := &m.processes[m.selected]
@@ -190,6 +239,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 
 		if index := numberKey(message.String()); index >= 0 && index < len(m.processes) {
 			m.selected = index
+			m.refreshSelected()
 			return m, nil
 		}
 
@@ -205,10 +255,14 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.MouseMsg:
+		if m.filterEditing {
+			return m, nil
+		}
 		if message.Action == tea.MouseActionPress && message.Button == tea.MouseButtonLeft {
 			bodyY := message.Y - headerHeight - panelTopBorderHeight
 			if message.X > 0 && message.X < m.sidebarWidth()-1 && bodyY >= 0 && bodyY < len(m.processes) {
 				m.selected = bodyY
+				m.refreshSelected()
 				return m, nil
 			}
 		}
@@ -244,14 +298,94 @@ func (m Model) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
 }
 
+func (m *Model) applyEvent(event process.Event) {
+	if event.Index < 0 || event.Index >= len(m.processes) {
+		return
+	}
+	item := &m.processes[event.Index]
+	if event.State != "" {
+		item.state = event.State
+	}
+	if event.PID > 0 {
+		item.pid = event.PID
+	}
+	if event.Line != "" {
+		m.appendLine(item, event.Line)
+	}
+	if event.Err != nil {
+		m.appendLine(item, errorStyle.Render("inline: "+event.Err.Error()))
+	}
+}
+
 func (m *Model) appendLine(item *processView, line string) {
-	item.lines = append(item.lines, line)
-	item.rendered = append(item.rendered, wrapLogLine(line, item.viewport.Width))
-	if len(item.lines) > maxLogLines {
-		item.lines = append([]string(nil), item.lines[len(item.lines)-maxLogLines:]...)
-		item.rendered = append([]string(nil), item.rendered[len(item.rendered)-maxLogLines:]...)
+	if item.logs.append(line) {
+		item.dirty = true
+	}
+}
+
+func (m *Model) beginFilter() tea.Cmd {
+	item := &m.processes[m.selected]
+	m.filterEditing = true
+	m.filterProcess = m.selected
+	m.filterOriginal = item.logs.query
+	m.filterInput.SetValue(item.logs.query)
+	m.filterInput.CursorEnd()
+	return m.filterInput.Focus()
+}
+
+func (m *Model) updateFilterInput(message tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.filterProcess < 0 || m.filterProcess >= len(m.processes) {
+		m.filterEditing = false
+		m.filterProcess = -1
+		m.filterInput.Blur()
+		return *m, nil
+	}
+
+	item := &m.processes[m.filterProcess]
+	switch message.String() {
+	case "enter":
+		m.filterEditing = false
+		m.filterProcess = -1
+		m.filterInput.Blur()
+		return *m, nil
+	case "esc":
+		if item.logs.setQuery(m.filterOriginal) {
+			item.dirty = true
+			m.refreshSelected()
+		}
+		m.filterEditing = false
+		m.filterProcess = -1
+		m.filterInput.Blur()
+		return *m, nil
+	}
+
+	input, command := m.filterInput.Update(message)
+	m.filterInput = input
+	if item.logs.setQuery(m.filterInput.Value()) {
+		item.dirty = true
+		m.refreshSelected()
+	}
+	return *m, command
+}
+
+func (m *Model) refreshSelected() {
+	if !m.ready || len(m.processes) == 0 {
+		return
+	}
+	m.refreshViewport(&m.processes[m.selected])
+}
+
+func (m *Model) refreshViewport(item *processView) {
+	if !item.dirty {
+		return
+	}
+	lines := item.logs.visibleLines()
+	item.rendered = make([]string, len(lines))
+	for index, line := range lines {
+		item.rendered[index] = wrapLogLine(line, item.viewport.Width)
 	}
 	item.viewport.SetContent(strings.Join(item.rendered, "\n"))
+	item.dirty = false
 	if item.follow {
 		item.viewport.GotoBottom()
 	}
@@ -273,26 +407,20 @@ func (m *Model) resize() {
 	mainWidth := max(1, m.width-m.sidebarWidth()-1)
 	viewportWidth := max(1, mainWidth-4)
 	viewportHeight := max(1, bodyHeight-panelVerticalChrome)
+	m.filterInput.Width = max(1, viewportWidth-2)
 	for index := range m.processes {
 		item := &m.processes[index]
 		widthChanged := item.viewport.Width != viewportWidth
 		item.viewport.Width = viewportWidth
 		item.viewport.Height = viewportHeight
 		if widthChanged {
-			m.rewrap(item)
-		}
-		if item.follow {
-			item.viewport.GotoBottom()
+			item.dirty = true
 		}
 	}
-}
-
-func (m *Model) rewrap(item *processView) {
-	item.rendered = make([]string, len(item.lines))
-	for index, line := range item.lines {
-		item.rendered[index] = wrapLogLine(line, item.viewport.Width)
+	m.refreshSelected()
+	if m.processes[m.selected].follow {
+		m.processes[m.selected].viewport.GotoBottom()
 	}
-	item.viewport.SetContent(strings.Join(item.rendered, "\n"))
 }
 
 func wrapLogLine(line string, width int) string {
@@ -375,6 +503,9 @@ func (m Model) renderPanel() string {
 	innerWidth := max(1, mainWidth-4)
 	command := commandStyle.Render(truncate("$ "+item.definition.Command, innerWidth))
 	status := renderStatus(item, innerWidth)
+	if m.filterEditing && m.filterProcess == m.selected {
+		status = m.filterInput.View()
+	}
 	divider := mutedStyle.Render(strings.Repeat("─", innerWidth))
 	content := lipgloss.JoinVertical(lipgloss.Left, command, status, divider, renderLogs(item))
 	return panelStyle.Width(mainWidth - 2).Render(content)
@@ -386,16 +517,31 @@ func renderStatus(item processView, width int) string {
 	if item.pid > 0 {
 		label += fmt.Sprintf(" · pid %d", item.pid)
 	}
-	label += fmt.Sprintf(" · %d lines", len(item.lines))
-	if item.state == process.Running && len(item.lines) == 0 {
+	if item.logs.normalizedQuery != "" {
+		label += fmt.Sprintf(" · %d/%d lines · filter: %q", item.logs.visibleCount(), item.logs.count(), item.logs.query)
+	} else {
+		label += fmt.Sprintf(" · %d lines", item.logs.count())
+	}
+	if item.state == process.Running && item.logs.count() == 0 {
 		label += " · waiting for output"
 	}
 	return style.Render(truncate(label, width))
 }
 
 func renderLogs(item processView) string {
-	if len(item.lines) > 0 {
+	if item.logs.visibleCount() > 0 {
 		return item.viewport.View()
+	}
+	if item.logs.count() > 0 {
+		retained := fmt.Sprintf("%d lines", item.logs.count())
+		if item.logs.count() == 1 {
+			retained = "1 line"
+		}
+		return lipgloss.NewStyle().
+			Foreground(colorMuted).
+			Width(item.viewport.Width).
+			Height(item.viewport.Height).
+			Render(fmt.Sprintf("No lines match %q. %s retained.", item.logs.query, retained))
 	}
 	return lipgloss.NewStyle().
 		Foreground(colorMuted).
@@ -406,12 +552,19 @@ func renderLogs(item processView) string {
 
 func (m Model) renderFooter() string {
 	item := m.processes[m.selected]
+	if m.filterEditing {
+		return m.renderFooterParts(" type to filter · enter apply · esc cancel", "filtering ")
+	}
 	mode := "paused"
 	if item.follow {
 		mode = "following"
 	}
-	left := " ↑/↓ process · pgup/pgdn scroll · f follow · q quit"
 	right := fmt.Sprintf("%s · %s · %3.0f%% ", m.version, mode, math.Round(item.viewport.ScrollPercent()*100))
+	left := " ↑/↓ process · / filter · pgup/pgdn scroll · f follow · q quit"
+	return m.renderFooterParts(left, right)
+}
+
+func (m Model) renderFooterParts(left, right string) string {
 	rightWidth := lipgloss.Width(right)
 	if rightWidth >= m.width {
 		return mutedStyle.Render(truncateLeft(right, m.width))
