@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/maful/inline/compare/v0.4.0...v0.5.0) (2026-08-31)
+
+
+### Features
+
+* add per-process log filtering ([#12](https://github.com/maful/inline/issues/12)) ([bccaa52](https://github.com/maful/inline/commit/bccaa52fe2177249fec9902c30ab1f63693b3d7e))
+
 ## [0.4.0](https://github.com/maful/inline/compare/v0.3.0...v0.4.0) (2026-08-30)
 
 
