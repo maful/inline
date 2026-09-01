@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -13,9 +14,13 @@ import (
 	"github.com/maful/inline/internal/procfile"
 )
 
-type fakeSource struct{ events chan process.Event }
+type fakeSource struct {
+	events   chan process.Event
+	restarts []int
+}
 
 func (f *fakeSource) StartAll()                    {}
+func (f *fakeSource) Restart(index int)            { f.restarts = append(f.restarts, index) }
 func (f *fakeSource) Events() <-chan process.Event { return f.events }
 
 func newTestModel() Model {
@@ -38,6 +43,43 @@ func TestProcessNavigation(t *testing.T) {
 	model = updated.(Model)
 	if model.selected != 0 {
 		t.Fatalf("selected after up = %d, want 0", model.selected)
+	}
+}
+
+func TestRestartKeyRestartsSelectedProcess(t *testing.T) {
+	source := &fakeSource{events: make(chan process.Event)}
+	model := New([]procfile.Process{
+		{Name: "web", Command: "bin/rails server"},
+		{Name: "worker", Command: "bundle exec sidekiq"},
+	}, source, "Procfile", "/Users/example/project", "main", "v1.2.3")
+	model.selected = 1
+
+	updated, command := model.Update(keyRunes("r"))
+	if command == nil {
+		t.Fatal("restart key returned no command")
+	}
+	command()
+	model = updated.(Model)
+
+	if got, want := source.restarts, []int{1}; !slices.Equal(got, want) {
+		t.Fatalf("restarts = %v, want %v", got, want)
+	}
+	if model.selected != 1 {
+		t.Fatalf("selected = %d, want 1", model.selected)
+	}
+}
+
+func TestStaleProcessEventDoesNotReplaceRestartedState(t *testing.T) {
+	model := newTestModel()
+	model.applyEvent(process.Event{Index: 0, Generation: 2, State: process.Running, PID: 2222})
+	model.applyEvent(process.Event{Index: 0, Generation: 1, State: process.Failed, Err: errors.New("old process exited")})
+
+	item := model.processes[0]
+	if item.state != process.Running || item.pid != 2222 {
+		t.Fatalf("state = %s, pid = %d; want running with pid 2222", item.state, item.pid)
+	}
+	if item.logs.count() != 0 {
+		t.Fatalf("stale event appended %d log lines, want 0", item.logs.count())
 	}
 }
 
@@ -249,7 +291,7 @@ func TestFooterSeparatesHelpAndShowsVersion(t *testing.T) {
 	footer := ansi.Strip(model.renderFooter())
 
 	for _, want := range []string{
-		"↑/↓ process · / filter · pgup/pgdn scroll · f follow · q quit",
+		"↑/↓ select · r restart · / filter · pgup/dn scroll · f follow · q quit",
 		"v1.2.3 · following · 100% ",
 	} {
 		if !strings.Contains(footer, want) {

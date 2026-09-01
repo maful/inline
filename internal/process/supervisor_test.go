@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -78,6 +79,122 @@ func TestStopAllTerminatesProcessGroup(t *testing.T) {
 	}
 }
 
+func TestRestartReplacesSelectedProcess(t *testing.T) {
+	supervisor := newSupervisor([]procfile.Process{
+		{Name: "long", Command: "trap 'exit 0' TERM; while :; do sleep 1; done"},
+		{Name: "other", Command: "trap 'exit 0' TERM; while :; do sleep 1; done"},
+	}, "/bin/sh", false)
+	supervisor.StartAll()
+	t.Cleanup(supervisor.StopAll)
+
+	first := waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
+		return event.Index == 0 && event.State == Running
+	})
+	if first.Generation != 1 {
+		t.Fatalf("first generation = %d, want 1", first.Generation)
+	}
+	other := waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
+		return event.Index == 1 && event.State == Running
+	})
+
+	started := time.Now()
+	supervisor.Restart(0)
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("Restart() took %s", elapsed)
+	}
+
+	var sawStopping, sawStarting bool
+	second := waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
+		if event.Index != 0 {
+			return false
+		}
+		if event.State == Failed {
+			t.Fatalf("restart emitted failed state: %v", event.Err)
+		}
+		switch event.State {
+		case Stopping:
+			sawStopping = true
+		case Starting:
+			sawStarting = true
+			if event.Line != "inline: restarting…" {
+				t.Fatalf("restart line = %q", event.Line)
+			}
+		}
+		return event.State == Running && event.Generation == 2
+	})
+
+	if !sawStopping || !sawStarting {
+		t.Fatalf("restart states: stopping=%t, starting=%t", sawStopping, sawStarting)
+	}
+	if second.PID == first.PID {
+		t.Fatalf("restarted PID = %d, want a PID different from %d", second.PID, first.PID)
+	}
+	if err := syscall.Kill(-first.PID, 0); err != syscall.ESRCH {
+		t.Fatalf("old process group still exists: kill(-%d, 0) = %v", first.PID, err)
+	}
+	otherItem := &supervisor.processes[1]
+	otherItem.mu.Lock()
+	otherPID := 0
+	if otherItem.command != nil && otherItem.command.Process != nil {
+		otherPID = otherItem.command.Process.Pid
+	}
+	otherGeneration := otherItem.generation
+	otherRunning := otherItem.running
+	otherItem.mu.Unlock()
+	if !otherRunning || otherPID != other.PID || otherGeneration != 1 {
+		t.Fatalf("other process changed: running=%t, pid=%d, generation=%d", otherRunning, otherPID, otherGeneration)
+	}
+}
+
+func TestConcurrentRestartsAreSerialized(t *testing.T) {
+	supervisor := newSupervisor([]procfile.Process{
+		{Name: "long", Command: "trap 'exit 0' TERM; while :; do sleep 1; done"},
+	}, "/bin/sh", false)
+	supervisor.StartAll()
+	t.Cleanup(supervisor.StopAll)
+	waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
+		return event.State == Running && event.Generation == 1
+	})
+
+	var restarts sync.WaitGroup
+	restarts.Add(2)
+	for range 2 {
+		go func() {
+			defer restarts.Done()
+			supervisor.Restart(0)
+		}()
+	}
+	restarts.Wait()
+
+	final := waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
+		if event.State == Failed {
+			t.Fatalf("concurrent restart emitted failed state: %v", event.Err)
+		}
+		return event.State == Running && event.Generation == 3
+	})
+	if final.PID <= 0 {
+		t.Fatalf("final PID = %d, want a positive PID", final.PID)
+	}
+}
+
+func TestRestartStartsExitedProcess(t *testing.T) {
+	supervisor := newSupervisor([]procfile.Process{{Name: "short", Command: "printf 'done\\n'"}}, "/bin/sh", false)
+	supervisor.StartAll()
+	t.Cleanup(supervisor.StopAll)
+
+	waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
+		return event.State == Exited && event.Generation == 1
+	})
+	supervisor.Restart(0)
+
+	restarted := waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
+		return event.State == Running && event.Generation == 2
+	})
+	if restarted.PID <= 0 {
+		t.Fatalf("restarted PID = %d, want a positive PID", restarted.PID)
+	}
+}
+
 func TestNewSupervisorUsesInteractiveUserShell(t *testing.T) {
 	t.Setenv("SHELL", "/bin/zsh")
 
@@ -125,6 +242,22 @@ func TestInteractiveZshLoadsAliases(t *testing.T) {
 			}
 		case <-deadline:
 			t.Fatal("timed out waiting for aliased process")
+		}
+	}
+}
+
+func waitForProcessEvent(t *testing.T, events <-chan Event, matches func(Event) bool) Event {
+	t.Helper()
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case event := <-events:
+			if matches(event) {
+				return event
+			}
+		case <-timer.C:
+			t.Fatal("timed out waiting for process event")
 		}
 	}
 }

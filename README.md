@@ -107,6 +107,7 @@ go run . -f Procfile.dev
 | `↑` / `↓`, `j` / `k` | Select a process |
 | `Tab`, `Shift+Tab`, `←` / `→` | Select the next or previous process |
 | `1`–`9` | Jump directly to a process |
+| `r` | Restart the selected process |
 | `PgUp` / `PgDn`, `Ctrl+U` / `Ctrl+D`, mouse wheel | Scroll logs |
 | `g` / `Home` | Jump to the top and pause following |
 | `G` / `End` | Jump to the bottom and resume following |
@@ -119,6 +120,8 @@ go run . -f Procfile.dev
 Each pane shows the process state, PID, and number of captured lines. Long output wraps to the pane width and reflows when the terminal is resized.
 
 Filters are case-insensitive literal searches and are kept separately for each process. Filtering only changes the visible lines: Inline retains the complete 20,000-line scrollback, so clearing or changing a filter restores earlier output. ANSI color codes are ignored while matching and preserved when matching lines are displayed.
+
+Restarting preserves the selected process's logs and filter, stops its complete process group, and starts the same Procfile command with a new PID. This lets a development server, worker, or watcher reload changes from disk without restarting the rest of the workspace. Changes to the Procfile itself are not reloaded.
 
 ### Shell commands and output
 
