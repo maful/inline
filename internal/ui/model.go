@@ -49,6 +49,7 @@ var (
 
 type processSource interface {
 	StartAll()
+	Restart(index int)
 	Events() <-chan process.Event
 }
 
@@ -59,6 +60,7 @@ type processView struct {
 	rendered   []string
 	state      process.State
 	pid        int
+	generation uint64
 	follow     bool
 	dirty      bool
 }
@@ -193,6 +195,12 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		switch message.String() {
 		case "q":
 			return m, tea.Quit
+		case "r":
+			index := m.selected
+			return m, func() tea.Msg {
+				m.source.Restart(index)
+				return nil
+			}
 		case "/":
 			return m, m.beginFilter()
 		case "esc":
@@ -303,8 +311,18 @@ func (m *Model) applyEvent(event process.Event) {
 		return
 	}
 	item := &m.processes[event.Index]
+	if event.Generation > 0 {
+		if event.Generation < item.generation {
+			return
+		}
+		item.generation = event.Generation
+	}
 	if event.State != "" {
 		item.state = event.State
+		switch event.State {
+		case process.Starting, process.Exited, process.Failed:
+			item.pid = 0
+		}
 	}
 	if event.PID > 0 {
 		item.pid = event.PID
@@ -560,7 +578,7 @@ func (m Model) renderFooter() string {
 		mode = "following"
 	}
 	right := fmt.Sprintf("%s · %s · %3.0f%% ", m.version, mode, math.Round(item.viewport.ScrollPercent()*100))
-	left := " ↑/↓ process · / filter · pgup/pgdn scroll · f follow · q quit"
+	left := " ↑/↓ select · r restart · / filter · pgup/dn scroll · f follow · q quit"
 	return m.renderFooterParts(left, right)
 }
 
