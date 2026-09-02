@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/x/ansi"
 )
@@ -10,6 +12,12 @@ type logEntry struct {
 	sequence   uint64
 	raw        string
 	searchable string
+}
+
+type matchSpan struct {
+	sequence uint64
+	start    int
+	end      int
 }
 
 // logBuffer keeps a bounded history and a sorted index of the entries that
@@ -23,6 +31,8 @@ type logBuffer struct {
 	normalizedQuery string
 	matches         []uint64
 	matchStart      int
+	occurrences     []matchSpan
+	occurrenceStart int
 }
 
 func newLogBuffer(capacity int) logBuffer {
@@ -41,6 +51,7 @@ func (b *logBuffer) append(raw string) bool {
 	if b.length == len(b.entries) {
 		evicted := b.entries[b.start]
 		visibleChanged = b.dropMatchThrough(evicted.sequence) || visibleChanged
+		b.dropOccurrenceThrough(evicted.sequence)
 		b.entries[b.start] = entry
 		b.start = (b.start + 1) % len(b.entries)
 	} else {
@@ -49,8 +60,10 @@ func (b *logBuffer) append(raw string) bool {
 		b.length++
 	}
 
-	if b.normalizedQuery != "" && strings.Contains(entry.searchable, b.normalizedQuery) {
+	spans := findOccurrenceSpans(entry.sequence, entry.searchable, b.normalizedQuery)
+	if len(spans) > 0 {
 		b.matches = append(b.matches, entry.sequence)
+		b.occurrences = append(b.occurrences, spans...)
 		visibleChanged = true
 	}
 	return visibleChanged
@@ -73,29 +86,41 @@ func (b *logBuffer) setQuery(query string) bool {
 	if normalized == "" {
 		b.matches = nil
 		b.matchStart = 0
+		b.occurrences = nil
+		b.occurrenceStart = 0
 		return true
 	}
 
 	matches := make([]uint64, 0)
+	occurrences := make([]matchSpan, 0)
 	if previous != "" && strings.HasPrefix(normalized, previous) {
 		matches = make([]uint64, 0, b.matchCount())
 		for _, sequence := range b.activeMatches() {
 			entry, ok := b.entry(sequence)
-			if ok && strings.Contains(entry.searchable, normalized) {
+			if !ok {
+				continue
+			}
+			spans := findOccurrenceSpans(sequence, entry.searchable, normalized)
+			if len(spans) > 0 {
 				matches = append(matches, sequence)
+				occurrences = append(occurrences, spans...)
 			}
 		}
 	} else {
 		matches = make([]uint64, 0, b.length)
 		b.each(func(entry logEntry) {
-			if strings.Contains(entry.searchable, normalized) {
+			spans := findOccurrenceSpans(entry.sequence, entry.searchable, normalized)
+			if len(spans) > 0 {
 				matches = append(matches, entry.sequence)
+				occurrences = append(occurrences, spans...)
 			}
 		})
 	}
 
 	b.matches = matches
 	b.matchStart = 0
+	b.occurrences = occurrences
+	b.occurrenceStart = 0
 	return true
 }
 
@@ -111,20 +136,29 @@ func (b *logBuffer) visibleCount() int {
 }
 
 func (b *logBuffer) visibleLines() []string {
-	lines := make([]string, 0, b.visibleCount())
+	entries := b.visibleEntries()
+	lines := make([]string, len(entries))
+	for index, entry := range entries {
+		lines[index] = entry.raw
+	}
+	return lines
+}
+
+func (b *logBuffer) visibleEntries() []logEntry {
+	entries := make([]logEntry, 0, b.visibleCount())
 	if b.normalizedQuery == "" {
 		b.each(func(entry logEntry) {
-			lines = append(lines, entry.raw)
+			entries = append(entries, entry)
 		})
-		return lines
+		return entries
 	}
 
 	for _, sequence := range b.activeMatches() {
 		if entry, ok := b.entry(sequence); ok {
-			lines = append(lines, entry.raw)
+			entries = append(entries, entry)
 		}
 	}
-	return lines
+	return entries
 }
 
 func (b *logBuffer) each(yield func(logEntry)) {
@@ -156,6 +190,27 @@ func (b *logBuffer) matchCount() int {
 	return len(b.matches) - b.matchStart
 }
 
+func (b *logBuffer) activeOccurrences() []matchSpan {
+	return b.occurrences[b.occurrenceStart:]
+}
+
+func (b *logBuffer) occurrenceCount() int {
+	return len(b.occurrences) - b.occurrenceStart
+}
+
+func (b *logBuffer) occurrenceIndex(target matchSpan) int {
+	occurrences := b.activeOccurrences()
+	index := sort.Search(len(occurrences), func(index int) bool {
+		candidate := occurrences[index]
+		return candidate.sequence > target.sequence ||
+			(candidate.sequence == target.sequence && candidate.start >= target.start)
+	})
+	if index < len(occurrences) && occurrences[index] == target {
+		return index
+	}
+	return -1
+}
+
 func (b *logBuffer) dropMatchThrough(sequence uint64) bool {
 	dropped := false
 	for b.matchStart < len(b.matches) && b.matches[b.matchStart] <= sequence {
@@ -167,6 +222,44 @@ func (b *logBuffer) dropMatchThrough(sequence uint64) bool {
 		b.matchStart = 0
 	}
 	return dropped
+}
+
+func (b *logBuffer) dropOccurrenceThrough(sequence uint64) {
+	for b.occurrenceStart < len(b.occurrences) && b.occurrences[b.occurrenceStart].sequence <= sequence {
+		b.occurrenceStart++
+	}
+	if b.occurrenceStart >= 1024 && b.occurrenceStart*2 >= len(b.occurrences) {
+		b.occurrences = append([]matchSpan(nil), b.occurrences[b.occurrenceStart:]...)
+		b.occurrenceStart = 0
+	}
+}
+
+func findOccurrenceSpans(sequence uint64, searchable, query string) []matchSpan {
+	if query == "" {
+		return nil
+	}
+
+	spans := make([]matchSpan, 0, 1)
+	byteOffset := 0
+	runeOffset := 0
+	for byteOffset < len(searchable) {
+		relative := strings.Index(searchable[byteOffset:], query)
+		if relative < 0 {
+			break
+		}
+		startByte := byteOffset + relative
+		endByte := startByte + len(query)
+		runeOffset += utf8.RuneCountInString(searchable[byteOffset:startByte])
+		matchRunes := utf8.RuneCountInString(searchable[startByte:endByte])
+		spans = append(spans, matchSpan{
+			sequence: sequence,
+			start:    runeOffset,
+			end:      runeOffset + matchRunes,
+		})
+		byteOffset = endByte
+		runeOffset += matchRunes
+	}
+	return spans
 }
 
 func normalizeForSearch(value string) string {
