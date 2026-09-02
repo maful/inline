@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.0](https://github.com/maful/inline/compare/v0.5.0...v0.6.0) (2026-09-02)
+
+
+### Features
+
+* add per-process restart ([#14](https://github.com/maful/inline/issues/14)) ([9c7d22f](https://github.com/maful/inline/commit/9c7d22f368a1b8803786853b418b6b846775d3c6))
+* highlight and navigate log filter matches ([#16](https://github.com/maful/inline/issues/16)) ([7352a3e](https://github.com/maful/inline/commit/7352a3efeb06fd1551f816828d9f31aad12bc42c))
+
 ## [0.5.0](https://github.com/maful/inline/compare/v0.4.0...v0.5.0) (2026-08-31)
 
 
