@@ -2,6 +2,7 @@ package ui
 
 import (
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -157,7 +158,8 @@ func TestFiltersAreLiveAndIndependentPerProcess(t *testing.T) {
 	if got, want := model.processes[0].logs.visibleLines(), []string{"web ERROR timeout"}; !slices.Equal(got, want) {
 		t.Fatalf("web visible lines = %v, want %v", got, want)
 	}
-	if !strings.Contains(model.View(), "web ERROR timeout") || strings.Contains(model.View(), "web ready") {
+	plainView := ansi.Strip(model.View())
+	if !strings.Contains(plainView, "web ERROR timeout") || strings.Contains(plainView, "web ready") {
 		t.Fatalf("web filter was not previewed live:\n%s", model.View())
 	}
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -228,6 +230,157 @@ func TestFilteredViewExplainsNoMatches(t *testing.T) {
 	}
 	if !strings.Contains(view, `No lines match "error". 1 line retained.`) {
 		t.Fatalf("view does not explain empty filtered output:\n%s", view)
+	}
+}
+
+func TestFilterHighlightsEveryOccurrenceAndPreservesANSI(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	model = updated.(Model)
+	line := "\x1b[31mERROR\x1b[32m then error\x1b[0m"
+	updated, _ = model.Update(process.Event{Index: 0, Line: line})
+	model = updated.(Model)
+
+	updated, _ = model.Update(keyRunes("/"))
+	model = updated.(Model)
+	updated, _ = model.Update(keyRunes("error"))
+	model = updated.(Model)
+
+	rendered := model.processes[0].rendered[0]
+	if got, want := ansi.Strip(rendered), ansi.Strip(line); got != want {
+		t.Fatalf("highlighted line stripped to %q, want %q", got, want)
+	}
+	if !strings.Contains(rendered, matchHighlightSequence(false)) {
+		t.Fatalf("line does not contain the regular match highlight: %q", rendered)
+	}
+	if !strings.Contains(rendered, matchHighlightSequence(true)) {
+		t.Fatalf("line does not contain the current match highlight: %q", rendered)
+	}
+	for _, color := range []string{"\x1b[31m", "\x1b[32m"} {
+		if !strings.Contains(rendered, color) {
+			t.Fatalf("highlighting removed original ANSI color %q: %q", color, rendered)
+		}
+	}
+	if strings.Contains(rendered, activeMatchMarker) {
+		t.Fatalf("rendered output contains the internal match marker: %q", rendered)
+	}
+}
+
+func TestHighlightRestoresOriginalBackground(t *testing.T) {
+	line := "\x1b[44merror tail\x1b[0m"
+	rendered := highlightLogLine(line, []matchSpan{{sequence: 0, start: 0, end: 5}}, -1)
+
+	if !strings.Contains(rendered, "\x1b[44m tail") {
+		t.Fatalf("highlight did not restore the original background: %q", rendered)
+	}
+}
+
+func TestMatchNavigationWrapsAndRevealsCurrentOccurrence(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 60, Height: 12})
+	model = updated.(Model)
+	for index := range 12 {
+		updated, _ = model.Update(process.Event{Index: 0, Line: fmt.Sprintf("error %02d", index)})
+		model = updated.(Model)
+	}
+
+	updated, _ = model.Update(keyRunes("/"))
+	model = updated.(Model)
+	updated, _ = model.Update(keyRunes("error"))
+	model = updated.(Model)
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if got := model.processes[0].matchCursor; got != 11 {
+		t.Fatalf("initial match cursor = %d, want 11", got)
+	}
+	if !strings.Contains(ansi.Strip(model.renderFooter()), "[12/12] matches") {
+		t.Fatalf("footer does not show the initial match position: %q", ansi.Strip(model.renderFooter()))
+	}
+
+	updated, _ = model.Update(keyRunes("n"))
+	model = updated.(Model)
+	item := model.processes[0]
+	if item.matchCursor != 0 || item.follow || item.viewport.YOffset != 0 {
+		t.Fatalf("next did not wrap to the first match: cursor=%d follow=%v offset=%d", item.matchCursor, item.follow, item.viewport.YOffset)
+	}
+
+	updated, _ = model.Update(keyRunes("N"))
+	model = updated.(Model)
+	item = model.processes[0]
+	if item.matchCursor != 11 {
+		t.Fatalf("previous cursor = %d, want 11", item.matchCursor)
+	}
+	if item.activeMatchRow < item.viewport.YOffset || item.activeMatchRow >= item.viewport.YOffset+item.viewport.Height {
+		t.Fatalf("current match row %d is outside viewport [%d,%d)", item.activeMatchRow, item.viewport.YOffset, item.viewport.YOffset+item.viewport.Height)
+	}
+}
+
+func TestMatchNavigationMovesBetweenOccurrencesOnOneLine(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	model = updated.(Model)
+	updated, _ = model.Update(process.Event{Index: 0, Line: "error then error"})
+	model = updated.(Model)
+	model.processes[0].logs.setQuery("error")
+	model.resetMatchCursor(&model.processes[0])
+	model.processes[0].dirty = true
+	model.refreshSelected()
+
+	before := model.processes[0].rendered[0]
+	if strings.Index(before, matchHighlightSequence(false)) >= strings.Index(before, matchHighlightSequence(true)) {
+		t.Fatalf("last occurrence is not current before navigation: %q", before)
+	}
+	updated, _ = model.Update(keyRunes("N"))
+	model = updated.(Model)
+	after := model.processes[0].rendered[0]
+	if strings.Index(after, matchHighlightSequence(true)) >= strings.Index(after, matchHighlightSequence(false)) {
+		t.Fatalf("previous did not select the first occurrence: %q", after)
+	}
+}
+
+func TestCurrentMatchRowTracksWrappedOutput(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 60, Height: 12})
+	model = updated.(Model)
+	updated, _ = model.Update(process.Event{Index: 0, Line: strings.Repeat("prefix ", 20) + "error"})
+	model = updated.(Model)
+	model.processes[0].logs.setQuery("error")
+	model.resetMatchCursor(&model.processes[0])
+	model.processes[0].dirty = true
+	model.refreshSelected()
+
+	item := model.processes[0]
+	if item.activeMatchRow <= 0 {
+		t.Fatalf("active match row = %d, want a wrapped row", item.activeMatchRow)
+	}
+	if item.activeMatchRow < item.viewport.YOffset || item.activeMatchRow >= item.viewport.YOffset+item.viewport.Height {
+		t.Fatalf("wrapped match row %d is outside viewport [%d,%d)", item.activeMatchRow, item.viewport.YOffset, item.viewport.YOffset+item.viewport.Height)
+	}
+}
+
+func TestPausedMatchSelectionSurvivesIncomingMatches(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	model = updated.(Model)
+	for _, line := range []string{"first error", "second error"} {
+		updated, _ = model.Update(process.Event{Index: 0, Line: line})
+		model = updated.(Model)
+	}
+	model.processes[0].logs.setQuery("error")
+	model.resetMatchCursor(&model.processes[0])
+	model.processes[0].dirty = true
+	model.refreshSelected()
+
+	updated, _ = model.Update(keyRunes("n"))
+	model = updated.(Model)
+	selected, ok := selectedOccurrence(&model.processes[0])
+	if !ok {
+		t.Fatal("no match selected after navigation")
+	}
+	updated, _ = model.Update(process.Event{Index: 0, Line: "third error"})
+	model = updated.(Model)
+	if current, ok := selectedOccurrence(&model.processes[0]); !ok || current != selected {
+		t.Fatalf("incoming match changed paused selection from %#v to %#v", selected, current)
 	}
 }
 

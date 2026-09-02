@@ -29,6 +29,27 @@ func TestLogBufferMatchesCaseInsensitivelyWithoutANSI(t *testing.T) {
 	}
 }
 
+func TestLogBufferIndexesEveryOccurrenceWithoutANSIOffsets(t *testing.T) {
+	buffer := newLogBuffer(10)
+	buffer.append("\x1b[31mERROR\x1b[0m then Error and café CAFÉ")
+
+	buffer.setQuery("error")
+	if got, want := buffer.activeOccurrences(), []matchSpan{
+		{sequence: 0, start: 0, end: 5},
+		{sequence: 0, start: 11, end: 16},
+	}; !slices.Equal(got, want) {
+		t.Fatalf("error occurrences = %#v, want %#v", got, want)
+	}
+
+	buffer.setQuery("café")
+	if got, want := buffer.activeOccurrences(), []matchSpan{
+		{sequence: 0, start: 21, end: 25},
+		{sequence: 0, start: 26, end: 30},
+	}; !slices.Equal(got, want) {
+		t.Fatalf("unicode occurrences = %#v, want %#v", got, want)
+	}
+}
+
 func TestLogBufferUpdatesMatchesForQueryChangesAndNewLines(t *testing.T) {
 	buffer := newLogBuffer(10)
 	for _, line := range []string{"server error", "worker error", "server ready"} {
@@ -62,6 +83,18 @@ func TestLogBufferDropsEvictedMatches(t *testing.T) {
 
 	if got, want := buffer.visibleLines(), []string{"new error"}; !slices.Equal(got, want) {
 		t.Fatalf("visible lines = %v, want %v", got, want)
+	}
+}
+
+func TestLogBufferDropsEveryOccurrenceFromEvictedLines(t *testing.T) {
+	buffer := newLogBuffer(2)
+	buffer.setQuery("error")
+	buffer.append("old error error")
+	buffer.append("ready")
+	buffer.append("new error")
+
+	if got, want := buffer.activeOccurrences(), []matchSpan{{sequence: 2, start: 4, end: 9}}; !slices.Equal(got, want) {
+		t.Fatalf("active occurrences = %#v, want %#v", got, want)
 	}
 }
 

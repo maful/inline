@@ -5,7 +5,9 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -37,6 +39,8 @@ var (
 	colorSuccess = lipgloss.AdaptiveColor{Light: "#2f855a", Dark: "#68d391"}
 	colorError   = lipgloss.AdaptiveColor{Light: "#c53030", Dark: "#fc8181"}
 	colorWarning = lipgloss.AdaptiveColor{Light: "#b7791f", Dark: "#f6c768"}
+	colorMatch   = lipgloss.AdaptiveColor{Light: "#e8dc8e", Dark: "#5f5b00"}
+	colorCurrent = lipgloss.AdaptiveColor{Light: "#f0a43a", Dark: "#b7791f"}
 
 	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(colorPrimary)
 	mutedStyle   = lipgloss.NewStyle().Foreground(colorMuted)
@@ -45,7 +49,11 @@ var (
 	panelStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorBorder)
 	activeStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#ffffff")).Background(colorPrimary).Bold(true)
 	errorStyle   = lipgloss.NewStyle().Foreground(colorError)
+	matchStyle   = lipgloss.NewStyle().Background(colorMatch)
+	currentStyle = lipgloss.NewStyle().Background(colorCurrent)
 )
+
+const activeMatchMarker = "\x1b]1337;inline-active-match\x07"
 
 type processSource interface {
 	StartAll()
@@ -54,15 +62,17 @@ type processSource interface {
 }
 
 type processView struct {
-	definition procfile.Process
-	viewport   viewport.Model
-	logs       logBuffer
-	rendered   []string
-	state      process.State
-	pid        int
-	generation uint64
-	follow     bool
-	dirty      bool
+	definition     procfile.Process
+	viewport       viewport.Model
+	logs           logBuffer
+	rendered       []string
+	state          process.State
+	pid            int
+	generation     uint64
+	follow         bool
+	dirty          bool
+	matchCursor    int
+	activeMatchRow int
 }
 
 // Model is Inline's Bubble Tea application state.
@@ -94,12 +104,14 @@ func New(definitions []procfile.Process, source processSource, path, workingDire
 		view := viewport.New(0, 0)
 		view.MouseWheelDelta = 3
 		views[index] = processView{
-			definition: definition,
-			viewport:   view,
-			logs:       newLogBuffer(maxLogLines),
-			state:      process.Starting,
-			follow:     true,
-			dirty:      true,
+			definition:     definition,
+			viewport:       view,
+			logs:           newLogBuffer(maxLogLines),
+			state:          process.Starting,
+			follow:         true,
+			dirty:          true,
+			matchCursor:    -1,
+			activeMatchRow: -1,
 		}
 	}
 	return Model{
@@ -206,9 +218,16 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case "esc":
 			item := &m.processes[m.selected]
 			if item.logs.setQuery("") {
+				item.matchCursor = -1
 				item.dirty = true
 				m.refreshSelected()
 			}
+			return m, nil
+		case "n":
+			m.navigateMatch(1)
+			return m, nil
+		case "N":
+			m.navigateMatch(-1)
 			return m, nil
 		case "tab", "right", "l":
 			m.selectRelative(1)
@@ -336,7 +355,9 @@ func (m *Model) applyEvent(event process.Event) {
 }
 
 func (m *Model) appendLine(item *processView, line string) {
+	current, hadCurrent := selectedOccurrence(item)
 	if item.logs.append(line) {
+		m.reconcileMatchCursor(item, current, hadCurrent)
 		item.dirty = true
 	}
 }
@@ -368,8 +389,10 @@ func (m *Model) updateFilterInput(message tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return *m, nil
 	case "esc":
 		if item.logs.setQuery(m.filterOriginal) {
+			m.resetMatchCursor(item)
 			item.dirty = true
 			m.refreshSelected()
+			m.revealActiveMatch(item)
 		}
 		m.filterEditing = false
 		m.filterProcess = -1
@@ -380,8 +403,10 @@ func (m *Model) updateFilterInput(message tea.KeyMsg) (tea.Model, tea.Cmd) {
 	input, command := m.filterInput.Update(message)
 	m.filterInput = input
 	if item.logs.setQuery(m.filterInput.Value()) {
+		m.resetMatchCursor(item)
 		item.dirty = true
 		m.refreshSelected()
+		m.revealActiveMatch(item)
 	}
 	return *m, command
 }
@@ -397,15 +422,107 @@ func (m *Model) refreshViewport(item *processView) {
 	if !item.dirty {
 		return
 	}
-	lines := item.logs.visibleLines()
-	item.rendered = make([]string, len(lines))
-	for index, line := range lines {
-		item.rendered[index] = wrapLogLine(line, item.viewport.Width)
+	entries := item.logs.visibleEntries()
+	item.rendered = make([]string, len(entries))
+	item.activeMatchRow = -1
+	occurrences := item.logs.activeOccurrences()
+	occurrenceIndex := 0
+	visualRow := 0
+	for index, entry := range entries {
+		start := occurrenceIndex
+		for occurrenceIndex < len(occurrences) && occurrences[occurrenceIndex].sequence == entry.sequence {
+			occurrenceIndex++
+		}
+		spans := occurrences[start:occurrenceIndex]
+		active := -1
+		if item.matchCursor >= start && item.matchCursor < occurrenceIndex {
+			active = item.matchCursor - start
+		}
+		line := highlightLogLine(entry.raw, spans, active)
+		wrapped := wrapLogLine(line, item.viewport.Width)
+		if marker := strings.Index(wrapped, activeMatchMarker); marker >= 0 {
+			item.activeMatchRow = visualRow + strings.Count(wrapped[:marker], "\n")
+			wrapped = strings.Replace(wrapped, activeMatchMarker, "", 1)
+		}
+		item.rendered[index] = wrapped
+		visualRow += lipgloss.Height(wrapped)
 	}
 	item.viewport.SetContent(strings.Join(item.rendered, "\n"))
 	item.dirty = false
 	if item.follow {
 		item.viewport.GotoBottom()
+	}
+}
+
+func selectedOccurrence(item *processView) (matchSpan, bool) {
+	occurrences := item.logs.activeOccurrences()
+	if item.matchCursor < 0 || item.matchCursor >= len(occurrences) {
+		return matchSpan{}, false
+	}
+	return occurrences[item.matchCursor], true
+}
+
+func (m *Model) resetMatchCursor(item *processView) {
+	count := item.logs.occurrenceCount()
+	if count == 0 {
+		item.matchCursor = -1
+		return
+	}
+	if item.follow {
+		item.matchCursor = count - 1
+		return
+	}
+	item.matchCursor = 0
+}
+
+func (m *Model) reconcileMatchCursor(item *processView, current matchSpan, hadCurrent bool) {
+	count := item.logs.occurrenceCount()
+	if count == 0 {
+		item.matchCursor = -1
+		return
+	}
+	if item.follow {
+		item.matchCursor = count - 1
+		return
+	}
+	if hadCurrent {
+		if index := item.logs.occurrenceIndex(current); index >= 0 {
+			item.matchCursor = index
+			return
+		}
+	}
+	item.matchCursor = min(max(item.matchCursor, 0), count-1)
+}
+
+func (m *Model) navigateMatch(delta int) {
+	if len(m.processes) == 0 {
+		return
+	}
+	item := &m.processes[m.selected]
+	count := item.logs.occurrenceCount()
+	if item.logs.normalizedQuery == "" || count == 0 {
+		return
+	}
+	if item.matchCursor < 0 || item.matchCursor >= count {
+		item.matchCursor = 0
+	} else {
+		item.matchCursor = (item.matchCursor + delta + count) % count
+	}
+	item.follow = false
+	item.dirty = true
+	m.refreshSelected()
+	m.revealActiveMatch(item)
+}
+
+func (m *Model) revealActiveMatch(item *processView) {
+	row := item.activeMatchRow
+	if row < 0 {
+		return
+	}
+	if row < item.viewport.YOffset {
+		item.viewport.SetYOffset(row)
+	} else if row >= item.viewport.YOffset+item.viewport.Height {
+		item.viewport.SetYOffset(row - item.viewport.Height + 1)
 	}
 }
 
@@ -438,6 +555,8 @@ func (m *Model) resize() {
 	m.refreshSelected()
 	if m.processes[m.selected].follow {
 		m.processes[m.selected].viewport.GotoBottom()
+	} else {
+		m.revealActiveMatch(&m.processes[m.selected])
 	}
 }
 
@@ -446,6 +565,140 @@ func wrapLogLine(line string, width int) string {
 		return line
 	}
 	return ansi.Wrap(line, width, "")
+}
+
+func highlightLogLine(line string, spans []matchSpan, active int) string {
+	if len(spans) == 0 {
+		return line
+	}
+
+	var output strings.Builder
+	state := byte(0)
+	byteOffset := 0
+	runeOffset := 0
+	spanIndex := 0
+	highlighted := -1
+	background := "\x1b[49m"
+
+	closeHighlight := func() {
+		if highlighted >= 0 {
+			output.WriteString(background)
+			highlighted = -1
+		}
+	}
+	openHighlight := func(index int) {
+		highlighted = index
+		output.WriteString(matchHighlightSequence(index == active))
+		if index == active {
+			output.WriteString(activeMatchMarker)
+		}
+	}
+
+	for byteOffset < len(line) {
+		sequence, _, consumed, nextState := ansi.GraphemeWidth.DecodeSequenceInString(line[byteOffset:], state, nil)
+		if consumed <= 0 {
+			break
+		}
+		byteOffset += consumed
+		state = nextState
+
+		plain := ansi.Strip(sequence)
+		if plain == "" {
+			output.WriteString(sequence)
+			if restored, changed := backgroundAfterSGR(sequence, background); changed {
+				background = restored
+				if highlighted >= 0 {
+					output.WriteString(matchHighlightSequence(highlighted == active))
+				}
+			}
+			continue
+		}
+
+		plainRunes := utf8.RuneCountInString(plain)
+		for spanIndex < len(spans) && runeOffset >= spans[spanIndex].end {
+			spanIndex++
+		}
+		desired := -1
+		if spanIndex < len(spans) && runeOffset < spans[spanIndex].end && runeOffset+plainRunes > spans[spanIndex].start {
+			desired = spanIndex
+		}
+		if desired != highlighted {
+			closeHighlight()
+			if desired >= 0 {
+				openHighlight(desired)
+			}
+		}
+		output.WriteString(sequence)
+		runeOffset += plainRunes
+		if highlighted >= 0 && runeOffset >= spans[highlighted].end {
+			closeHighlight()
+			spanIndex++
+		}
+	}
+	closeHighlight()
+	if byteOffset < len(line) {
+		output.WriteString(line[byteOffset:])
+	}
+	return output.String()
+}
+
+func matchHighlightSequence(active bool) string {
+	style := matchStyle
+	if active {
+		style = currentStyle
+	}
+	const marker = "\ue000"
+	rendered := style.Render(marker)
+	if index := strings.Index(rendered, marker); index > 0 {
+		return rendered[:index]
+	}
+	if active {
+		return "\x1b[48;5;178m"
+	}
+	return "\x1b[48;5;58m"
+}
+
+func backgroundAfterSGR(sequence, current string) (string, bool) {
+	if !strings.HasPrefix(sequence, "\x1b[") || !strings.HasSuffix(sequence, "m") {
+		return current, false
+	}
+	body := strings.TrimSuffix(strings.TrimPrefix(sequence, "\x1b["), "m")
+	if body == "" {
+		return "\x1b[49m", true
+	}
+
+	parameters := strings.Split(body, ";")
+	restored := current
+	changed := false
+	for index := 0; index < len(parameters); index++ {
+		parameter := parameters[index]
+		if strings.HasPrefix(parameter, "48:") {
+			restored = "\x1b[" + parameter + "m"
+			changed = true
+			continue
+		}
+		value, err := strconv.Atoi(parameter)
+		if err != nil {
+			continue
+		}
+		switch {
+		case value == 0 || value == 49:
+			restored = "\x1b[49m"
+			changed = true
+		case value >= 40 && value <= 47, value >= 100 && value <= 107:
+			restored = "\x1b[" + parameter + "m"
+			changed = true
+		case value == 48 && index+2 < len(parameters) && parameters[index+1] == "5":
+			restored = "\x1b[" + strings.Join(parameters[index:index+3], ";") + "m"
+			changed = true
+			index += 2
+		case value == 48 && index+4 < len(parameters) && parameters[index+1] == "2":
+			restored = "\x1b[" + strings.Join(parameters[index:index+5], ";") + "m"
+			changed = true
+			index += 4
+		}
+	}
+	return restored, changed
 }
 
 func (m Model) renderHeader() string {
@@ -579,6 +832,13 @@ func (m Model) renderFooter() string {
 	}
 	right := fmt.Sprintf("%s · %s · %3.0f%% ", m.version, mode, math.Round(item.viewport.ScrollPercent()*100))
 	left := " ↑/↓ select · r restart · / filter · pgup/dn scroll · f follow · q quit"
+	if item.logs.normalizedQuery != "" {
+		current := 0
+		if item.matchCursor >= 0 && item.matchCursor < item.logs.occurrenceCount() {
+			current = item.matchCursor + 1
+		}
+		left = fmt.Sprintf(" [%d/%d] matches · n next · N prev · esc clear · / edit", current, item.logs.occurrenceCount())
+	}
 	return m.renderFooterParts(left, right)
 }
 

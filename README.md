@@ -114,12 +114,15 @@ go run . -f Procfile.dev
 | `f` | Toggle automatic bottom-follow |
 | `/` | Edit the selected process's log filter |
 | `Enter` / `Esc` | Apply or cancel a filter edit |
+| `n` / `N` | Select the next or previous filter match |
 | `Esc` | Clear the selected process's applied filter |
 | `q`, `Ctrl+C` | Stop every process and quit |
 
 Each pane shows the process state, PID, and number of captured lines. Long output wraps to the pane width and reflows when the terminal is resized.
 
 Filters are case-insensitive literal searches and are kept separately for each process. Filtering only changes the visible lines: Inline retains the complete 20,000-line scrollback, so clearing or changing a filter restores earlier output. ANSI color codes are ignored while matching and preserved when matching lines are displayed.
+
+Inline highlights each occurrence in the matching lines. Press `n` or `N` to select the next or previous occurrence. Selection wraps at both ends.
 
 Restarting preserves the selected process's logs and filter, stops its complete process group, and starts the same Procfile command with a new PID. This lets a development server, worker, or watcher reload changes from disk without restarting the rest of the workspace. Changes to the Procfile itself are not reloaded.
 
