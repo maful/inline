@@ -9,6 +9,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -29,6 +30,7 @@ const (
 	panelVerticalChrome   = panelBorderHeight + panelHeaderHeight
 	minimumTerminalHeight = headerHeight + footerHeight + panelVerticalChrome + 1
 	maxEventBatch         = 256
+	sidebarMarkerWidth    = 3
 )
 
 var (
@@ -87,6 +89,7 @@ type Model struct {
 	width            int
 	height           int
 	ready            bool
+	startupSpinner   spinner.Model
 	filterInput      textinput.Model
 	filterEditing    bool
 	filterProcess    int
@@ -95,6 +98,7 @@ type Model struct {
 
 func New(definitions []procfile.Process, source processSource, path, workingDirectory, branch, version string) Model {
 	homeDirectory, _ := os.UserHomeDir()
+	startupSpinner := spinner.New(spinner.WithSpinner(spinner.Points))
 	filterInput := textinput.New()
 	filterInput.Prompt = "/ "
 	filterInput.Placeholder = "filter logs"
@@ -121,6 +125,7 @@ func New(definitions []procfile.Process, source processSource, path, workingDire
 		workingDirectory: abbreviateHomeDirectory(workingDirectory, homeDirectory),
 		branch:           branch,
 		version:          version,
+		startupSpinner:   startupSpinner,
 		filterInput:      filterInput,
 		filterProcess:    -1,
 	}
@@ -148,6 +153,7 @@ func (m Model) Init() tea.Cmd {
 			return nil
 		},
 		waitForEvent(m.source.Events()),
+		m.startupSpinner.Tick,
 	)
 }
 
@@ -185,16 +191,32 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case process.Event:
+		wasStarting := m.hasStartingProcess()
 		m.applyEvent(message)
 		m.refreshSelected()
+		if !wasStarting && m.hasStartingProcess() {
+			return m, tea.Batch(waitForEvent(m.source.Events()), m.startupSpinner.Tick)
+		}
 		return m, waitForEvent(m.source.Events())
 
 	case processEventBatch:
+		wasStarting := m.hasStartingProcess()
 		for _, event := range message {
 			m.applyEvent(event)
 		}
 		m.refreshSelected()
+		if !wasStarting && m.hasStartingProcess() {
+			return m, tea.Batch(waitForEvent(m.source.Events()), m.startupSpinner.Tick)
+		}
 		return m, waitForEvent(m.source.Events())
+
+	case spinner.TickMsg:
+		if !m.hasStartingProcess() {
+			return m, nil
+		}
+		var command tea.Cmd
+		m.startupSpinner, command = m.startupSpinner.Update(message)
+		return m, command
 
 	case tea.KeyMsg:
 		if message.String() == "ctrl+c" {
@@ -352,6 +374,15 @@ func (m *Model) applyEvent(event process.Event) {
 	if event.Err != nil {
 		m.appendLine(item, errorStyle.Render("inline: "+event.Err.Error()))
 	}
+}
+
+func (m Model) hasStartingProcess() bool {
+	for _, item := range m.processes {
+		if item.state == process.Starting {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Model) appendLine(item *processView, line string) {
@@ -749,6 +780,11 @@ func (m Model) renderSidebar() string {
 	rows := make([]string, 0, len(m.processes))
 	for index, item := range m.processes {
 		marker, markerStyle := stateMarker(item.state)
+		if item.state == process.Starting {
+			marker = m.startupSpinner.View()
+			markerStyle = lipgloss.NewStyle().Foreground(colorSuccess)
+		}
+		marker = lipgloss.NewStyle().Width(sidebarMarkerWidth).Align(lipgloss.Center).Render(marker)
 		style := lipgloss.NewStyle().Width(innerWidth).MaxWidth(innerWidth)
 		if index == m.selected {
 			// Keep the selected label plain before applying its background. A nested
