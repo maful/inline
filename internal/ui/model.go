@@ -75,6 +75,7 @@ type processView struct {
 	dirty          bool
 	matchCursor    int
 	activeMatchRow int
+	logsCleared    bool
 }
 
 // Model is Inline's Bubble Tea application state.
@@ -229,6 +230,14 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		switch message.String() {
 		case "q":
 			return m, tea.Quit
+		case "c":
+			item := &m.processes[m.selected]
+			item.logs.clear()
+			item.matchCursor = -1
+			item.logsCleared = true
+			item.dirty = true
+			m.refreshSelected()
+			return m, nil
 		case "r":
 			index := m.selected
 			return m, func() tea.Msg {
@@ -386,6 +395,7 @@ func (m Model) hasStartingProcess() bool {
 }
 
 func (m *Model) appendLine(item *processView, line string) {
+	item.logsCleared = false
 	current, hadCurrent := selectedOccurrence(item)
 	if item.logs.append(line) {
 		m.reconcileMatchCursor(item, current, hadCurrent)
@@ -850,6 +860,13 @@ func renderLogs(item processView) string {
 			Height(item.viewport.Height).
 			Render(fmt.Sprintf("No lines match %q. %s retained.", item.logs.query, retained))
 	}
+	if item.logsCleared {
+		return lipgloss.NewStyle().
+			Foreground(colorMuted).
+			Width(item.viewport.Width).
+			Height(item.viewport.Height).
+			Render("Inline cleared the logs. New output will appear here.")
+	}
 	return lipgloss.NewStyle().
 		Foreground(colorMuted).
 		Width(item.viewport.Width).
@@ -867,13 +884,13 @@ func (m Model) renderFooter() string {
 		mode = "following"
 	}
 	right := fmt.Sprintf("%s · %s · %3.0f%% ", m.version, mode, math.Round(item.viewport.ScrollPercent()*100))
-	left := " ↑/↓ select · r restart · / filter · pgup/dn scroll · f follow · q quit"
+	left := " ↑/↓ select · r restart · c clear · / filter · pgup/dn · f follow · q quit"
 	if item.logs.normalizedQuery != "" {
 		current := 0
 		if item.matchCursor >= 0 && item.matchCursor < item.logs.occurrenceCount() {
 			current = item.matchCursor + 1
 		}
-		left = fmt.Sprintf(" [%d/%d] matches · n next · N prev · esc clear · / edit", current, item.logs.occurrenceCount())
+		left = fmt.Sprintf(" [%d/%d] matches · c clear logs · n next · N prev · esc clear filter · / edit", current, item.logs.occurrenceCount())
 	}
 	return m.renderFooterParts(left, right)
 }

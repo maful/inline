@@ -39,6 +39,16 @@ func newLogBuffer(capacity int) logBuffer {
 	return logBuffer{entries: make([]logEntry, max(1, capacity))}
 }
 
+func (b *logBuffer) clear() {
+	clear(b.entries)
+	b.start = 0
+	b.length = 0
+	b.matches = nil
+	b.matchStart = 0
+	b.occurrences = nil
+	b.occurrenceStart = 0
+}
+
 func (b *logBuffer) append(raw string) bool {
 	entry := logEntry{
 		sequence:   b.nextSequence,

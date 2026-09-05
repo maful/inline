@@ -108,6 +108,7 @@ go run . -f Procfile.dev
 | `Tab`, `Shift+Tab`, `←` / `→` | Select the next or previous process |
 | `1`–`9` | Jump directly to a process |
 | `r` | Restart the selected process |
+| `c` | Clear logs for the selected process |
 | `PgUp` / `PgDn`, `Ctrl+U` / `Ctrl+D`, mouse wheel | Scroll logs |
 | `g` / `Home` | Jump to the top and pause following |
 | `G` / `End` | Jump to the bottom and resume following |
@@ -125,6 +126,8 @@ Filters are case-insensitive literal searches and are kept separately for each p
 Inline highlights each occurrence in the matching lines. Press `n` or `N` to select the next or previous occurrence. Selection wraps at both ends.
 
 Restarting preserves the selected process's logs and filter, stops its complete process group, and starts the same Procfile command with a new PID. This lets a development server, worker, or watcher reload changes from disk without restarting the rest of the workspace. Changes to the Procfile itself are not reloaded.
+
+When you press `c`, Inline removes the captured lines for the selected process. The selected process stays active. Inline preserves the filter and follow mode for the selected process. Inline captures new output after the clear action.
 
 ### Shell commands and output
 
