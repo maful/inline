@@ -120,6 +120,89 @@ func TestQuietProcessStillShowsRunningStatus(t *testing.T) {
 	}
 }
 
+func TestStartingSidebarUsesAnimatedPoints(t *testing.T) {
+	model := newTestModel()
+	model.width = 100
+	model.height = 30
+	model.ready = true
+
+	firstFrame := ansi.Strip(model.renderSidebar())
+	if !strings.Contains(firstFrame, "∙∙∙") {
+		t.Fatalf("starting sidebar does not show the first Points frame:\n%s", firstFrame)
+	}
+
+	updated, command := model.Update(model.startupSpinner.Tick())
+	model = updated.(Model)
+	if command == nil {
+		t.Fatal("spinner tick did not schedule the next frame")
+	}
+	secondFrame := ansi.Strip(model.renderSidebar())
+	if !strings.Contains(secondFrame, "●∙∙") {
+		t.Fatalf("starting sidebar does not show the second Points frame:\n%s", secondFrame)
+	}
+}
+
+func TestRunningSidebarUsesStaticSuccessMarker(t *testing.T) {
+	model := newTestModel()
+	model.width = 100
+	model.height = 30
+	model.ready = true
+	for index := range model.processes {
+		model.processes[index].state = process.Running
+	}
+
+	sidebar := ansi.Strip(model.renderSidebar())
+	if strings.Contains(sidebar, "∙") {
+		t.Fatalf("running sidebar still shows the Points spinner:\n%s", sidebar)
+	}
+	if !strings.Contains(sidebar, "●") {
+		t.Fatalf("running sidebar does not show the static success marker:\n%s", sidebar)
+	}
+}
+
+func TestSidebarMarkersKeepProcessNamesAligned(t *testing.T) {
+	model := newTestModel()
+	model.width = 100
+	model.height = 30
+	model.ready = true
+	model.processes[0].state = process.Starting
+	model.processes[1].state = process.Failed
+
+	rows := strings.Split(ansi.Strip(model.renderSidebar()), "\n")
+	var webColumn, workerColumn int
+	for _, row := range rows {
+		if index := strings.Index(row, "web"); index >= 0 {
+			webColumn = lipgloss.Width(row[:index])
+		}
+		if index := strings.Index(row, "worker"); index >= 0 {
+			workerColumn = lipgloss.Width(row[:index])
+		}
+	}
+	if webColumn == 0 || workerColumn == 0 {
+		t.Fatalf("sidebar does not contain both process rows:\n%s", strings.Join(rows, "\n"))
+	}
+	if webColumn != workerColumn {
+		t.Fatalf("process names start at columns %d and %d, want equal columns", webColumn, workerColumn)
+	}
+}
+
+func TestSpinnerStopsWhenNoProcessIsStarting(t *testing.T) {
+	model := newTestModel()
+	for index := range model.processes {
+		model.processes[index].state = process.Running
+	}
+	firstFrame := model.startupSpinner.View()
+
+	updated, command := model.Update(model.startupSpinner.Tick())
+	model = updated.(Model)
+	if command != nil {
+		t.Fatal("spinner tick scheduled another frame without a starting process")
+	}
+	if secondFrame := model.startupSpinner.View(); secondFrame != firstFrame {
+		t.Fatalf("spinner advanced from %q to %q without a starting process", firstFrame, secondFrame)
+	}
+}
+
 func TestStatusShowsReceivedLineCount(t *testing.T) {
 	model := newTestModel()
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
