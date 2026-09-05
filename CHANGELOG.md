@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.0](https://github.com/maful/inline/compare/v0.6.0...v0.7.0) (2026-09-05)
+
+
+### Features
+
+* **ui:** animate process startup indicators ([#17](https://github.com/maful/inline/issues/17)) ([4f6727e](https://github.com/maful/inline/commit/4f6727e13c71fdbbbe8172c0f4c70913b9d8789e))
+* **ui:** clear selected process logs with c ([#19](https://github.com/maful/inline/issues/19)) ([a456411](https://github.com/maful/inline/commit/a45641136ce58af8ee7d1887ea972a00dd5759dc))
+
 ## [0.6.0](https://github.com/maful/inline/compare/v0.5.0...v0.6.0) (2026-09-02)
 
 
