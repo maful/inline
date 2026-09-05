@@ -17,6 +17,35 @@ func TestLogBufferRetainsNewestLinesInOrder(t *testing.T) {
 	}
 }
 
+func TestLogBufferClearPreservesFilterAndAcceptsNewLines(t *testing.T) {
+	buffer := newLogBuffer(3)
+	buffer.setQuery("error")
+	buffer.append("old error")
+	buffer.append("old ready")
+	nextSequence := buffer.nextSequence
+
+	buffer.clear()
+
+	if buffer.count() != 0 || buffer.visibleCount() != 0 {
+		t.Fatalf("counts after clear = %d/%d, want 0/0", buffer.visibleCount(), buffer.count())
+	}
+	if buffer.query != "error" || buffer.normalizedQuery != "error" {
+		t.Fatalf("filter after clear = %q/%q, want error/error", buffer.query, buffer.normalizedQuery)
+	}
+	if buffer.matchCount() != 0 || buffer.occurrenceCount() != 0 {
+		t.Fatalf("search index after clear = %d matches and %d occurrences, want 0 and 0", buffer.matchCount(), buffer.occurrenceCount())
+	}
+	if buffer.nextSequence != nextSequence {
+		t.Fatalf("next sequence after clear = %d, want %d", buffer.nextSequence, nextSequence)
+	}
+
+	buffer.append("new ready")
+	buffer.append("new error")
+	if got, want := buffer.visibleLines(), []string{"new error"}; !slices.Equal(got, want) {
+		t.Fatalf("visible lines after new output = %v, want %v", got, want)
+	}
+}
+
 func TestLogBufferMatchesCaseInsensitivelyWithoutANSI(t *testing.T) {
 	buffer := newLogBuffer(10)
 	buffer.append("\x1b[31mERROR\x1b[0m database unavailable")

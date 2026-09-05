@@ -70,6 +70,81 @@ func TestRestartKeyRestartsSelectedProcess(t *testing.T) {
 	}
 }
 
+func TestClearKeyClearsOnlySelectedProcessLogs(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	model = updated.(Model)
+	for _, event := range []process.Event{
+		{Index: 0, State: process.Running, PID: 1234, Line: "old web error"},
+		{Index: 0, Line: "old web ready"},
+		{Index: 1, State: process.Running, PID: 5678, Line: "worker ready"},
+	} {
+		updated, _ = model.Update(event)
+		model = updated.(Model)
+	}
+	item := &model.processes[0]
+	item.logs.setQuery("error")
+	model.resetMatchCursor(item)
+	item.follow = false
+	item.dirty = true
+	model.refreshSelected()
+
+	updated, command := model.Update(keyRunes("c"))
+	model = updated.(Model)
+	item = &model.processes[0]
+
+	if command != nil {
+		t.Fatal("clear key returned a command")
+	}
+	if item.logs.count() != 0 || item.logs.visibleCount() != 0 {
+		t.Fatalf("selected process counts = %d/%d, want 0/0", item.logs.visibleCount(), item.logs.count())
+	}
+	if item.logs.query != "error" {
+		t.Fatalf("filter after clear = %q, want error", item.logs.query)
+	}
+	if item.matchCursor != -1 || item.logs.occurrenceCount() != 0 {
+		t.Fatalf("match state after clear = cursor %d with %d occurrences, want -1 with 0", item.matchCursor, item.logs.occurrenceCount())
+	}
+	if item.follow {
+		t.Fatal("clear key resumed log following")
+	}
+	if item.state != process.Running || item.pid != 1234 {
+		t.Fatalf("process after clear = %s with pid %d, want running with pid 1234", item.state, item.pid)
+	}
+	if got, want := model.processes[1].logs.visibleLines(), []string{"worker ready"}; !slices.Equal(got, want) {
+		t.Fatalf("other process lines = %v, want %v", got, want)
+	}
+	if view := ansi.Strip(model.View()); !strings.Contains(view, `0/0 lines · filter: "error"`) || !strings.Contains(view, "Inline cleared the logs") {
+		t.Fatalf("view does not show the cleared filtered log:\n%s", view)
+	}
+
+	updated, _ = model.Update(process.Event{Index: 0, Line: "new web error"})
+	model = updated.(Model)
+	if got, want := model.processes[0].logs.visibleLines(), []string{"new web error"}; !slices.Equal(got, want) {
+		t.Fatalf("selected process lines after new output = %v, want %v", got, want)
+	}
+	if model.processes[0].logsCleared {
+		t.Fatal("selected process remains marked as cleared after new output")
+	}
+}
+
+func TestClearKeyTypesIntoFilterInput(t *testing.T) {
+	model := newTestModel()
+	model.processes[0].logs.append("captured output")
+
+	updated, _ := model.Update(keyRunes("/"))
+	model = updated.(Model)
+	updated, _ = model.Update(keyRunes("c"))
+	model = updated.(Model)
+
+	if model.filterInput.Value() != "c" {
+		t.Fatalf("filter input = %q, want c", model.filterInput.Value())
+	}
+	if model.processes[0].logs.count() != 1 {
+		t.Fatalf("log count after filter input = %d, want 1", model.processes[0].logs.count())
+	}
+}
+
 func TestStaleProcessEventDoesNotReplaceRestartedState(t *testing.T) {
 	model := newTestModel()
 	model.applyEvent(process.Event{Index: 0, Generation: 2, State: process.Running, PID: 2222})
@@ -523,11 +598,11 @@ func TestViewContainsProcessNamesAndCommand(t *testing.T) {
 
 func TestFooterSeparatesHelpAndShowsVersion(t *testing.T) {
 	model := newTestModel()
-	model.width = 100
+	model.width = 120
 	footer := ansi.Strip(model.renderFooter())
 
 	for _, want := range []string{
-		"↑/↓ select · r restart · / filter · pgup/dn scroll · f follow · q quit",
+		"↑/↓ select · r restart · c clear · / filter · pgup/dn · f follow · q quit",
 		"v1.2.3 · following · 100% ",
 	} {
 		if !strings.Contains(footer, want) {
