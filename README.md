@@ -21,7 +21,7 @@ Install the latest release on macOS or Linux:
 curl -fsSL https://github.com/maful/inline/releases/latest/download/install.sh | sh
 ```
 
-The installer supports Intel/AMD and ARM64 systems. It installs into `~/.local/share/inline` and links the active version at `~/.local/bin/inline`; it never requires `sudo`.
+The installer supports Intel/AMD and ARM64 systems. macOS requires version 13 Ventura or later. The installer places releases in `~/.local/share/inline` and links the active version at `~/.local/bin/inline`; it never requires `sudo`.
 
 To inspect the installer before running it:
 
@@ -141,7 +141,7 @@ Quitting sends `SIGTERM` to every managed process group, including child process
 
 ## Development
 
-Inline requires Go 1.26.5 or newer. Install the dependencies and build a development binary from the repository root:
+Inline requires Go 1.27.1 or newer. Install the dependencies and build a development binary from the repository root:
 
 ```sh
 go mod download
