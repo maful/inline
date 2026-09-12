@@ -53,7 +53,7 @@ func TestLogBufferMatchesCaseInsensitivelyWithoutANSI(t *testing.T) {
 
 	buffer.setQuery("error")
 
-	if got, want := buffer.visibleLines(), []string{"\x1b[31mERROR\x1b[0m database unavailable"}; !slices.Equal(got, want) {
+	if got, want := buffer.visibleLines(), []string{"\x1b[31mERROR\x1b[0m database unavailable\x1b[0m"}; !slices.Equal(got, want) {
 		t.Fatalf("visible lines = %q, want %q", got, want)
 	}
 }
