@@ -106,6 +106,8 @@ func New(definitions []procfile.Process, source processSource, path, workingDire
 	filterInput.CharLimit = 256
 	views := make([]processView, len(definitions))
 	for index, definition := range definitions {
+		definition.Name = sanitizeDisplayText(definition.Name)
+		definition.Command = sanitizeDisplayText(definition.Command)
 		view := viewport.New(0, 0)
 		view.MouseWheelDelta = 3
 		views[index] = processView{
@@ -122,10 +124,10 @@ func New(definitions []procfile.Process, source processSource, path, workingDire
 	return Model{
 		processes:        views,
 		source:           source,
-		path:             path,
-		workingDirectory: abbreviateHomeDirectory(workingDirectory, homeDirectory),
-		branch:           branch,
-		version:          version,
+		path:             sanitizeDisplayText(path),
+		workingDirectory: sanitizeDisplayText(abbreviateHomeDirectory(workingDirectory, homeDirectory)),
+		branch:           sanitizeDisplayText(branch),
+		version:          sanitizeDisplayText(version),
 		startupSpinner:   startupSpinner,
 		filterInput:      filterInput,
 		filterProcess:    -1,

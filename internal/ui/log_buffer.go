@@ -50,6 +50,7 @@ func (b *logBuffer) clear() {
 }
 
 func (b *logBuffer) append(raw string) bool {
+	raw = sanitizeLogLine(raw)
 	entry := logEntry{
 		sequence:   b.nextSequence,
 		raw:        raw,
