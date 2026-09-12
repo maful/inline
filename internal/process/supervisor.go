@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"sync"
@@ -11,6 +12,14 @@ import (
 	"time"
 
 	"github.com/maful/inline/internal/procfile"
+)
+
+const (
+	// MaxOutputLineBytes bounds each line before it enters the event queue.
+	MaxOutputLineBytes = 64 * 1024
+	eventBufferSize    = 256
+	truncationBoundary = "\x1b\\"
+	truncationMarker   = "... [output truncated]"
 )
 
 type State string
@@ -66,7 +75,7 @@ func newSupervisor(definitions []procfile.Process, shell string, interactive boo
 	return &Supervisor{
 		definitions: definitions,
 		processes:   make([]runningProcess, len(definitions)),
-		events:      make(chan Event, 2048),
+		events:      make(chan Event, eventBufferSize),
 		shell:       shell,
 		interactive: interactive,
 	}
@@ -177,22 +186,38 @@ func (s *Supervisor) buildCommand(script string) *exec.Cmd {
 }
 
 func (s *Supervisor) observe(index int, generation uint64, command *exec.Cmd, done chan struct{}, reader *os.File, writer *os.File) {
-	linesDone := make(chan struct{})
+	type outputResult struct {
+		dropped int
+		err     error
+	}
+	linesDone := make(chan outputResult, 1)
 	go func() {
-		defer close(linesDone)
-		scanner := bufio.NewScanner(reader)
-		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-		for scanner.Scan() {
-			s.events <- Event{Index: index, Generation: generation, Line: scanner.Text()}
+		dropped := 0
+		emit := func(line string) {
+			if dropped > 0 {
+				marker := fmt.Sprintf("inline: dropped %d log lines while the UI was busy", dropped)
+				if !s.sendOutputLine(Event{Index: index, Generation: generation, Line: marker}) {
+					dropped++
+					return
+				}
+				dropped = 0
+			}
+			if !s.sendOutputLine(Event{Index: index, Generation: generation, Line: line}) {
+				dropped++
+			}
 		}
-		if err := scanner.Err(); err != nil && !errors.Is(err, os.ErrClosed) {
-			s.events <- Event{Index: index, Generation: generation, Line: fmt.Sprintf("inline: read output: %v", err)}
+		err := readOutputLines(reader, func(line string) {
+			emit(line)
+		})
+		if errors.Is(err, os.ErrClosed) {
+			err = nil
 		}
+		linesDone <- outputResult{dropped: dropped, err: err}
 	}()
 
 	err := command.Wait()
 	writer.Close()
-	<-linesDone
+	output := <-linesDone
 	reader.Close()
 
 	item := &s.processes[index]
@@ -209,11 +234,89 @@ func (s *Supervisor) observe(index int, generation uint64, command *exec.Cmd, do
 	if stopRequested {
 		return
 	}
+	line := ""
+	if output.dropped > 0 {
+		line = fmt.Sprintf("inline: dropped %d log lines while the UI was busy", output.dropped)
+	}
+	if output.err != nil {
+		if line != "" {
+			line += "; "
+		}
+		line += fmt.Sprintf("inline: read output: %v", output.err)
+	}
 	if err != nil {
-		s.events <- Event{Index: index, Generation: generation, State: Failed, Err: err}
+		s.events <- Event{Index: index, Generation: generation, Line: line, State: Failed, Err: err}
 		return
 	}
-	s.events <- Event{Index: index, Generation: generation, State: Exited}
+	s.events <- Event{Index: index, Generation: generation, Line: line, State: Exited}
+}
+
+func (s *Supervisor) sendOutputLine(event Event) bool {
+	select {
+	case s.events <- event:
+		return true
+	default:
+		return false
+	}
+}
+
+// readOutputLines retains a bounded prefix of each line and drains the rest.
+// Continuing to read is required because abandoning a full output pipe can
+// leave the managed process blocked in write while command.Wait waits for it.
+func readOutputLines(reader io.Reader, yield func(string)) error {
+	buffer := bufio.NewReaderSize(reader, MaxOutputLineBytes)
+	line := make([]byte, 0, MaxOutputLineBytes)
+	truncated := false
+	sawData := false
+
+	for {
+		fragment, err := buffer.ReadSlice('\n')
+		hadNewline := len(fragment) > 0 && fragment[len(fragment)-1] == '\n'
+		if hadNewline {
+			fragment = fragment[:len(fragment)-1]
+		}
+		if len(fragment) > 0 {
+			sawData = true
+		}
+
+		remaining := MaxOutputLineBytes - len(line)
+		if remaining > 0 {
+			kept := min(remaining, len(fragment))
+			line = append(line, fragment[:kept]...)
+			fragment = fragment[kept:]
+		}
+		if len(fragment) > 0 {
+			truncated = true
+		}
+
+		complete := hadNewline || (err != nil && !errors.Is(err, bufio.ErrBufferFull))
+		if complete && (sawData || hadNewline) {
+			if !truncated && len(line) > 0 && line[len(line)-1] == '\r' {
+				line = line[:len(line)-1]
+			}
+			yield(formatOutputLine(line, truncated))
+			line = line[:0]
+			truncated = false
+			sawData = false
+		}
+
+		switch {
+		case err == nil, errors.Is(err, bufio.ErrBufferFull):
+			continue
+		case errors.Is(err, io.EOF):
+			return nil
+		default:
+			return err
+		}
+	}
+}
+
+func formatOutputLine(line []byte, truncated bool) string {
+	if !truncated {
+		return string(line)
+	}
+	prefixBytes := MaxOutputLineBytes - len(truncationBoundary) - len(truncationMarker)
+	return string(line[:min(len(line), prefixBytes)]) + truncationBoundary + truncationMarker
 }
 
 // StopAll asks every process group to exit, then force-stops any survivors.

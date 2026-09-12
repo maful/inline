@@ -391,6 +391,56 @@ func TestFilteredViewExplainsNoMatches(t *testing.T) {
 	}
 }
 
+func TestModelEvictsOldestEntryAcrossProcessesAtGlobalBudget(t *testing.T) {
+	model := newTestModel()
+	model.maxRetainedBytes = 16
+	model.applyEvent(process.Event{Index: 0, Line: "aaaa"})
+	model.applyEvent(process.Event{Index: 1, Line: "bbbb"})
+	model.applyEvent(process.Event{Index: 0, Line: "cccc"})
+
+	if got, want := model.processes[0].logs.visibleLines(), []string{"cccc"}; !slices.Equal(got, want) {
+		t.Fatalf("first process lines = %q, want %q", got, want)
+	}
+	if got, want := model.processes[1].logs.visibleLines(), []string{"bbbb"}; !slices.Equal(got, want) {
+		t.Fatalf("second process lines = %q, want %q", got, want)
+	}
+	if model.retainedLogBytes > model.maxRetainedBytes {
+		t.Fatalf("global retained bytes = %d, want at most %d", model.retainedLogBytes, model.maxRetainedBytes)
+	}
+}
+
+func TestViewportContentIsBounded(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	model = updated.(Model)
+	model.processes[0].maxRenderBytes = 256
+	for index := range 20 {
+		updated, _ = model.Update(process.Event{Index: 0, Line: fmt.Sprintf("line %02d %s", index, strings.Repeat("x", 32))})
+		model = updated.(Model)
+	}
+
+	content := strings.Join(model.processes[0].rendered, "\n")
+	if len(content) > model.processes[0].maxRenderBytes {
+		t.Fatalf("rendered content bytes = %d, want at most %d", len(content), model.processes[0].maxRenderBytes)
+	}
+	if !strings.Contains(content, "older retained output omitted") || !strings.Contains(content, "line 19") {
+		t.Fatalf("bounded viewport does not show its omission marker and newest output: %q", content)
+	}
+}
+
+func TestFooterReportsLimitedMatchNavigation(t *testing.T) {
+	model := newTestModel()
+	model.width = 300
+	model.processes[0].logs.setQuery("a")
+	model.processes[0].logs.append(strings.Repeat("a", maxIndexedOccurrences+1))
+	model.resetMatchCursor(&model.processes[0])
+
+	footer := ansi.Strip(model.renderFooter())
+	if !strings.Contains(footer, "10000 indexed · 10001 total") || !strings.Contains(footer, "navigation limited") {
+		t.Fatalf("footer does not report bounded navigation: %q", footer)
+	}
+}
+
 func TestFilterHighlightsEveryOccurrenceAndPreservesANSI(t *testing.T) {
 	model := newTestModel()
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})

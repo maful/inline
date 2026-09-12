@@ -22,6 +22,10 @@ import (
 
 const (
 	maxLogLines           = 20_000
+	maxLogLineBytes       = process.MaxOutputLineBytes
+	maxProcessLogBytes    = 16 * 1024 * 1024
+	maxTotalLogBytes      = 64 * 1024 * 1024
+	maxRenderedLogBytes   = 8 * 1024 * 1024
 	headerHeight          = 2
 	footerHeight          = 1
 	panelTopBorderHeight  = 1
@@ -76,6 +80,7 @@ type processView struct {
 	matchCursor    int
 	activeMatchRow int
 	logsCleared    bool
+	maxRenderBytes int
 }
 
 // Model is Inline's Bubble Tea application state.
@@ -95,6 +100,9 @@ type Model struct {
 	filterEditing    bool
 	filterProcess    int
 	filterOriginal   string
+	nextLogArrival   uint64
+	retainedLogBytes int
+	maxRetainedBytes int
 }
 
 func New(definitions []procfile.Process, source processSource, path, workingDirectory, branch, version string) Model {
@@ -113,12 +121,13 @@ func New(definitions []procfile.Process, source processSource, path, workingDire
 		views[index] = processView{
 			definition:     definition,
 			viewport:       view,
-			logs:           newLogBuffer(maxLogLines),
+			logs:           newLogBufferWithBudget(maxLogLines, maxProcessLogBytes),
 			state:          process.Starting,
 			follow:         true,
 			dirty:          true,
 			matchCursor:    -1,
 			activeMatchRow: -1,
+			maxRenderBytes: maxRenderedLogBytes,
 		}
 	}
 	return Model{
@@ -131,6 +140,7 @@ func New(definitions []procfile.Process, source processSource, path, workingDire
 		startupSpinner:   startupSpinner,
 		filterInput:      filterInput,
 		filterProcess:    -1,
+		maxRetainedBytes: maxTotalLogBytes,
 	}
 }
 
@@ -235,6 +245,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case "c":
 			item := &m.processes[m.selected]
 			item.logs.clear()
+			m.retainedLogBytes = m.totalRetainedLogBytes()
 			item.matchCursor = -1
 			item.logsCleared = true
 			item.dirty = true
@@ -380,10 +391,10 @@ func (m *Model) applyEvent(event process.Event) {
 		item.pid = event.PID
 	}
 	if event.Line != "" {
-		m.appendLine(item, event.Line)
+		m.appendLine(event.Index, event.Line)
 	}
 	if event.Err != nil {
-		m.appendLine(item, errorStyle.Render("inline: "+event.Err.Error()))
+		m.appendLine(event.Index, errorStyle.Render("inline: "+event.Err.Error()))
 	}
 }
 
@@ -396,12 +407,55 @@ func (m Model) hasStartingProcess() bool {
 	return false
 }
 
-func (m *Model) appendLine(item *processView, line string) {
+func (m *Model) appendLine(index int, line string) {
+	item := &m.processes[index]
 	item.logsCleared = false
 	current, hadCurrent := selectedOccurrence(item)
-	if item.logs.append(line) {
+	m.nextLogArrival++
+	if item.logs.appendWithArrival(line, m.nextLogArrival) {
 		m.reconcileMatchCursor(item, current, hadCurrent)
 		item.dirty = true
+	}
+	m.retainedLogBytes = m.totalRetainedLogBytes()
+	m.enforceGlobalLogBudget()
+}
+
+func (m *Model) totalRetainedLogBytes() int {
+	total := 0
+	for index := range m.processes {
+		total += m.processes[index].logs.byteCount()
+	}
+	return total
+}
+
+func (m *Model) enforceGlobalLogBudget() {
+	budget := m.maxRetainedBytes
+	if budget <= 0 {
+		budget = maxTotalLogBytes
+	}
+	for m.retainedLogBytes > budget {
+		oldestIndex := -1
+		var oldestArrival uint64
+		for index := range m.processes {
+			entry, ok := m.processes[index].logs.oldest()
+			if ok && (oldestIndex < 0 || entry.arrival < oldestArrival) {
+				oldestIndex = index
+				oldestArrival = entry.arrival
+			}
+		}
+		if oldestIndex < 0 {
+			m.retainedLogBytes = 0
+			return
+		}
+
+		item := &m.processes[oldestIndex]
+		current, hadCurrent := selectedOccurrence(item)
+		entry, changed := item.logs.evictOldest()
+		m.retainedLogBytes -= entry.retainedBytes()
+		if changed {
+			m.reconcileMatchCursor(item, current, hadCurrent)
+			item.dirty = true
+		}
 	}
 }
 
@@ -466,31 +520,69 @@ func (m *Model) refreshViewport(item *processView) {
 		return
 	}
 	entries := item.logs.visibleEntries()
-	item.rendered = make([]string, len(entries))
-	item.activeMatchRow = -1
-	occurrences := item.logs.activeOccurrences()
-	occurrenceIndex := 0
-	visualRow := 0
-	for index, entry := range entries {
-		start := occurrenceIndex
-		for occurrenceIndex < len(occurrences) && occurrences[occurrenceIndex].sequence == entry.sequence {
-			occurrenceIndex++
+	end := len(entries)
+	if current, ok := selectedOccurrence(item); ok {
+		for index, entry := range entries {
+			if entry.sequence == current.sequence {
+				end = index + 1
+				break
+			}
 		}
-		spans := occurrences[start:occurrenceIndex]
+	}
+
+	const (
+		omittedBeforeMarker = "... older retained output omitted from this view ..."
+		omittedAfterMarker  = "... newer retained output omitted from this view ..."
+	)
+	renderBudget := item.maxRenderBytes
+	if renderBudget <= 0 {
+		renderBudget = maxRenderedLogBytes
+	}
+	lineBudget := max(1, renderBudget-len(omittedBeforeMarker)-len(omittedAfterMarker)-2)
+	rendered := make([]string, 0, end)
+	renderedBytes := 0
+	omittedBefore := false
+	for index := end - 1; index >= 0; index-- {
+		entry := entries[index]
+		spans, start := item.logs.occurrencesFor(entry.sequence)
 		active := -1
-		if item.matchCursor >= start && item.matchCursor < occurrenceIndex {
+		if item.matchCursor >= start && item.matchCursor < start+len(spans) {
 			active = item.matchCursor - start
 		}
 		line := highlightLogLine(entry.raw, spans, active)
 		wrapped := wrapLogLine(line, item.viewport.Width)
-		if marker := strings.Index(wrapped, activeMatchMarker); marker >= 0 {
-			item.activeMatchRow = visualRow + strings.Count(wrapped[:marker], "\n")
-			wrapped = strings.Replace(wrapped, activeMatchMarker, "", 1)
+		required := len(wrapped)
+		if len(rendered) > 0 {
+			required++
 		}
-		item.rendered[index] = wrapped
-		visualRow += lipgloss.Height(wrapped)
+		if renderedBytes+required > lineBudget {
+			omittedBefore = true
+			break
+		}
+		rendered = append(rendered, wrapped)
+		renderedBytes += required
 	}
-	item.viewport.SetContent(strings.Join(item.rendered, "\n"))
+	for left, right := 0, len(rendered)-1; left < right; left, right = left+1, right-1 {
+		rendered[left], rendered[right] = rendered[right], rendered[left]
+	}
+	if omittedBefore {
+		rendered = append([]string{omittedBeforeMarker}, rendered...)
+	}
+	if end < len(entries) {
+		rendered = append(rendered, omittedAfterMarker)
+	}
+
+	content := strings.Join(rendered, "\n")
+	item.activeMatchRow = -1
+	if marker := strings.Index(content, activeMatchMarker); marker >= 0 {
+		item.activeMatchRow = strings.Count(content[:marker], "\n")
+		content = strings.Replace(content, activeMatchMarker, "", 1)
+		for index := range rendered {
+			rendered[index] = strings.Replace(rendered[index], activeMatchMarker, "", 1)
+		}
+	}
+	item.rendered = rendered
+	item.viewport.SetContent(content)
 	item.dirty = false
 	if item.follow {
 		item.viewport.GotoBottom()
@@ -512,6 +604,10 @@ func (m *Model) resetMatchCursor(item *processView) {
 		return
 	}
 	if item.follow {
+		if item.logs.occurrencesLimited() {
+			item.matchCursor = -1
+			return
+		}
 		item.matchCursor = count - 1
 		return
 	}
@@ -525,6 +621,10 @@ func (m *Model) reconcileMatchCursor(item *processView, current matchSpan, hadCu
 		return
 	}
 	if item.follow {
+		if item.logs.occurrencesLimited() {
+			item.matchCursor = -1
+			return
+		}
 		item.matchCursor = count - 1
 		return
 	}
@@ -608,6 +708,28 @@ func wrapLogLine(line string, width int) string {
 		return line
 	}
 	return ansi.Wrap(line, width, "")
+}
+
+func truncateLogLine(line string, maxBytes int) string {
+	if len(line) <= maxBytes {
+		return line
+	}
+	const (
+		reset  = "\x1b[0m"
+		marker = "... [output truncated]"
+	)
+	prefixLimit := max(0, maxBytes-len(reset)-len(marker))
+	state := byte(0)
+	offset := 0
+	for offset < len(line) {
+		_, _, consumed, nextState := ansi.GraphemeWidth.DecodeSequenceInString(line[offset:], state, nil)
+		if consumed <= 0 || offset+consumed > prefixLimit {
+			break
+		}
+		offset += consumed
+		state = nextState
+	}
+	return line[:offset] + reset + marker
 }
 
 func highlightLogLine(line string, spans []matchSpan, active int) string {
@@ -892,7 +1014,11 @@ func (m Model) renderFooter() string {
 		if item.matchCursor >= 0 && item.matchCursor < item.logs.occurrenceCount() {
 			current = item.matchCursor + 1
 		}
-		left = fmt.Sprintf(" [%d/%d] matches · c clear logs · n next · N prev · esc clear filter · / edit", current, item.logs.occurrenceCount())
+		if item.logs.occurrencesLimited() {
+			left = fmt.Sprintf(" [%d/%d indexed · %d total] matches · navigation limited · c clear · n/N move · esc clear filter", current, item.logs.occurrenceCount(), item.logs.totalOccurrenceCount())
+		} else {
+			left = fmt.Sprintf(" [%d/%d] matches · c clear logs · n next · N prev · esc clear filter · / edit", current, item.logs.totalOccurrenceCount())
+		}
 	}
 	return m.renderFooterParts(left, right)
 }
