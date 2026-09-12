@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -141,6 +142,83 @@ func TestLogBufferReportsOnlyVisibleChangesWhileFiltered(t *testing.T) {
 	}
 	if changed := buffer.append("done"); !changed {
 		t.Fatal("evicting a matched line did not report a visible change")
+	}
+}
+
+func TestLogBufferEvictsOldestEntriesAtByteBudget(t *testing.T) {
+	buffer := newLogBufferWithBudget(10, 16)
+	buffer.append("aaaa")
+	buffer.append("bbbb")
+	buffer.append("cccc")
+
+	if got, want := buffer.visibleLines(), []string{"bbbb", "cccc"}; !slices.Equal(got, want) {
+		t.Fatalf("visible lines = %q, want %q", got, want)
+	}
+	if got := buffer.byteCount(); got > 16 {
+		t.Fatalf("retained bytes = %d, want at most 16", got)
+	}
+}
+
+func TestLogBufferBoundsLineLength(t *testing.T) {
+	buffer := newLogBuffer(1)
+	buffer.append(strings.Repeat("é", maxLogLineBytes))
+	line := buffer.visibleLines()[0]
+
+	if len(line) > maxLogLineBytes {
+		t.Fatalf("retained line bytes = %d, want at most %d", len(line), maxLogLineBytes)
+	}
+	if !strings.HasSuffix(line, "... [output truncated]") {
+		t.Fatalf("retained line does not have a truncation marker")
+	}
+}
+
+func TestLogBufferCapsOccurrenceSpansAndKeepsTotal(t *testing.T) {
+	const extraMatches = 123
+	buffer := newLogBuffer(1)
+	buffer.setQuery("a")
+	buffer.append(strings.Repeat("a", maxIndexedOccurrences+extraMatches))
+
+	if got := buffer.occurrenceCount(); got != maxIndexedOccurrences {
+		t.Fatalf("indexed occurrences = %d, want %d", got, maxIndexedOccurrences)
+	}
+	if got := buffer.totalOccurrenceCount(); got != maxIndexedOccurrences+extraMatches {
+		t.Fatalf("total occurrences = %d, want %d", got, maxIndexedOccurrences+extraMatches)
+	}
+	if !buffer.occurrencesLimited() {
+		t.Fatal("occurrence overflow is not reported")
+	}
+	if got := cap(buffer.occurrences); got != maxIndexedOccurrences {
+		t.Fatalf("occurrence backing capacity = %d, want %d", got, maxIndexedOccurrences)
+	}
+}
+
+func TestReportedLongLineSearchStaysWithinBudgets(t *testing.T) {
+	buffer := newLogBuffer(maxLogLines)
+	buffer.append(strings.Repeat("a", 1024*1024-2))
+	buffer.setQuery("a")
+
+	if got := len(buffer.visibleLines()[0]); got > maxLogLineBytes {
+		t.Fatalf("retained line bytes = %d, want at most %d", got, maxLogLineBytes)
+	}
+	if got := buffer.byteCount(); got > 2*maxLogLineBytes {
+		t.Fatalf("retained searchable bytes = %d, want at most %d", got, 2*maxLogLineBytes)
+	}
+	if got := buffer.occurrenceCount(); got != maxIndexedOccurrences {
+		t.Fatalf("indexed occurrences = %d, want %d", got, maxIndexedOccurrences)
+	}
+	if got := cap(buffer.occurrences); got != maxIndexedOccurrences {
+		t.Fatalf("occurrence backing capacity = %d, want %d", got, maxIndexedOccurrences)
+	}
+}
+
+func TestLogBufferUpdatesTotalOccurrencesAfterEviction(t *testing.T) {
+	buffer := newLogBuffer(1)
+	buffer.setQuery("a")
+	buffer.append("aaa")
+	buffer.append("aa")
+
+	if got := buffer.totalOccurrenceCount(); got != 2 {
+		t.Fatalf("total occurrences after eviction = %d, want 2", got)
 	}
 }
 

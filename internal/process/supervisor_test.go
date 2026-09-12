@@ -47,6 +47,90 @@ func TestSupervisorCapturesOutputAndExit(t *testing.T) {
 	}
 }
 
+func TestReadOutputLinesTruncatesAndContinues(t *testing.T) {
+	input := strings.Repeat("a", MaxOutputLineBytes+1024) + "\nafter\r\npartial"
+	var lines []string
+	if err := readOutputLines(strings.NewReader(input), func(line string) {
+		lines = append(lines, line)
+	}); err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+
+	if len(lines) != 3 {
+		t.Fatalf("captured %d lines, want 3", len(lines))
+	}
+	if len(lines[0]) != MaxOutputLineBytes || !strings.HasSuffix(lines[0], truncationMarker) {
+		t.Fatalf("truncated line length/suffix = %d/%q", len(lines[0]), lines[0][len(lines[0])-len(truncationMarker):])
+	}
+	if lines[1] != "after" || lines[2] != "partial" {
+		t.Fatalf("lines after oversized output = %q, want [after partial]", lines[1:])
+	}
+}
+
+func TestSupervisorDrainsOutputAfterOversizedLine(t *testing.T) {
+	supervisor := newSupervisor([]procfile.Process{{
+		Name:    "large",
+		Command: `awk 'BEGIN { for (i = 0; i < 1048576; i++) printf "a"; printf "\nafter\n" }'`,
+	}}, "/bin/sh", false)
+	supervisor.StartAll()
+	t.Cleanup(supervisor.StopAll)
+
+	deadline := time.After(5 * time.Second)
+	var lines []string
+	for {
+		select {
+		case event := <-supervisor.Events():
+			if event.Line != "" {
+				lines = append(lines, event.Line)
+			}
+			if event.State == Failed {
+				t.Fatalf("process failed: %v", event.Err)
+			}
+			if event.State == Exited {
+				if len(lines) != 2 {
+					t.Fatalf("captured %d lines, want 2", len(lines))
+				}
+				if len(lines[0]) != MaxOutputLineBytes || lines[1] != "after" {
+					t.Fatalf("captured line lengths/content = %d/%q", len(lines[0]), lines[1:])
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for process to drain oversized output and exit")
+		}
+	}
+}
+
+func TestEventQueueHasBoundedPayloadCapacity(t *testing.T) {
+	supervisor := newSupervisor(nil, "/bin/sh", false)
+	if got := cap(supervisor.events); got != eventBufferSize {
+		t.Fatalf("event queue capacity = %d, want %d", got, eventBufferSize)
+	}
+	if got := cap(supervisor.events) * MaxOutputLineBytes; got != 16*1024*1024 {
+		t.Fatalf("maximum queued line payload = %d, want 16 MiB", got)
+	}
+}
+
+func TestOutputDoesNotBlockWhenEventQueueIsFull(t *testing.T) {
+	supervisor := newSupervisor(nil, "/bin/sh", false)
+	for range cap(supervisor.events) {
+		supervisor.events <- Event{State: Running}
+	}
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- supervisor.sendOutputLine(Event{Line: "overflow"})
+	}()
+	select {
+	case sent := <-done:
+		if sent {
+			t.Fatal("output was accepted by a full event queue")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("sending output blocked on a full event queue")
+	}
+}
+
 func TestStopAllTerminatesProcessGroup(t *testing.T) {
 	supervisor := newSupervisor([]procfile.Process{{Name: "long", Command: "sleep 30"}}, "/bin/sh", false)
 	supervisor.StartAll()

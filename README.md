@@ -7,7 +7,7 @@ Procfile is supported as a first-class, drop-in configuration format—not the b
 ## Why Inline
 
 - Keep servers, workers, asset builders, tunnels, and log streams in one terminal without mixing their output.
-- Give every process an isolated, ANSI-aware log view with line wrapping and up to 20,000 lines of scrollback.
+- Give every process an isolated, ANSI-aware log view with line wrapping and bounded scrollback.
 - Move between processes with the keyboard or mouse while active logs automatically follow the latest output.
 - Stop the complete process tree cleanly when leaving Inline.
 
@@ -121,9 +121,13 @@ go run . -f Procfile.dev
 
 Each pane shows the process state, PID, and number of captured lines. Long output wraps to the pane width and reflows when the terminal is resized.
 
-Filters are case-insensitive literal searches and are kept separately for each process. Filtering only changes the visible lines: Inline retains the complete 20,000-line scrollback, so clearing or changing a filter restores earlier output. ANSI color codes are ignored while matching and preserved when matching lines are displayed.
+Filters are case-insensitive literal searches and are kept separately for each process. Filtering only changes the visible lines. Inline retains up to 20,000 lines and 16 MiB of log storage per process, with a 64 MiB limit across all processes. Lines longer than 64 KiB are truncated with a visible marker. ANSI color codes are ignored while matching and preserved when matching lines are displayed.
 
-Inline highlights each occurrence in the matching lines. Press `n` or `N` to select the next or previous occurrence. Selection wraps at both ends.
+The output queue holds at most 256 lines. If the UI cannot keep up with a sustained burst, Inline continues draining the managed process and reports how many log lines it dropped.
+
+Inline materializes at most 8 MiB in the active viewport. It shows an omission marker when retained output falls outside that window. Selecting an indexed filter match rebuilds the window around that match.
+
+Inline highlights each indexed occurrence in the matching lines. Press `n` or `N` to select the next or previous occurrence. Selection wraps at both ends. For unusually dense matches, Inline reports the complete count and limits keyboard navigation to the first 10,000 occurrences.
 
 Restarting preserves the selected process's logs and filter, stops its complete process group, and starts the same Procfile command with a new PID. This lets a development server, worker, or watcher reload changes from disk without restarting the rest of the workspace. Changes to the Procfile itself are not reloaded.
 
