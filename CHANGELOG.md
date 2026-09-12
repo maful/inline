@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.1](https://github.com/maful/inline/compare/v0.7.0...v0.7.1) (2026-09-12)
+
+
+### Bug Fixes
+
+* bound log memory usage ([#23](https://github.com/maful/inline/issues/23)) ([73383cb](https://github.com/maful/inline/commit/73383cb2523ff43c016a7a248fb680ece283076c))
+* **ui:** sanitize terminal control sequences ([#22](https://github.com/maful/inline/issues/22)) ([184c7fe](https://github.com/maful/inline/commit/184c7fe250e1a42b1c7d1abbc98a449b04efae22))
+
+
+### Miscellaneous Chores
+
+* upgrade Go to 1.27.1 ([#20](https://github.com/maful/inline/issues/20)) ([b1c95c1](https://github.com/maful/inline/commit/b1c95c1e36d634f9e468d71273a3481ab2791c7e))
+
 ## [0.7.0](https://github.com/maful/inline/compare/v0.6.0...v0.7.0) (2026-09-05)
 
 
