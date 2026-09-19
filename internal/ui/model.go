@@ -100,6 +100,8 @@ type Model struct {
 	filterEditing    bool
 	filterProcess    int
 	filterOriginal   string
+	viewMode         bool
+	viewModeSnapshot string
 	nextLogArrival   uint64
 	retainedLogBytes int
 	maxRetainedBytes int
@@ -197,10 +199,16 @@ func waitForEvent(events <-chan process.Event) tea.Cmd {
 func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch message := message.(type) {
 	case tea.WindowSizeMsg:
+		wasViewMode := m.viewMode
+		m.viewMode = false
+		m.viewModeSnapshot = ""
 		m.width = message.Width
 		m.height = message.Height
 		m.ready = true
 		m.resize()
+		if wasViewMode {
+			return m, tea.EnableMouseCellMotion
+		}
 		return m, nil
 
 	case process.Event:
@@ -235,6 +243,19 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if message.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
+		if m.viewMode {
+			switch message.String() {
+			case "v", "esc":
+				m.viewMode = false
+				m.viewModeSnapshot = ""
+				m.refreshSelected()
+				return m, tea.EnableMouseCellMotion
+			case "q":
+				return m, tea.Quit
+			default:
+				return m, nil
+			}
+		}
 		if m.filterEditing {
 			return m.updateFilterInput(message)
 		}
@@ -257,6 +278,10 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.source.Restart(index)
 				return nil
 			}
+		case "v":
+			m.viewMode = true
+			m.viewModeSnapshot = m.renderView()
+			return m, tea.DisableMouse
 		case "/":
 			return m, m.beginFilter()
 		case "esc":
@@ -326,6 +351,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.MouseMsg:
+		if m.viewMode {
+			return m, nil
+		}
 		if m.filterEditing {
 			return m, nil
 		}
@@ -355,6 +383,13 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) View() string {
+	if m.viewMode && m.viewModeSnapshot != "" {
+		return m.viewModeSnapshot
+	}
+	return m.renderView()
+}
+
+func (m Model) renderView() string {
 	if !m.ready || m.width == 0 || m.height == 0 {
 		return "Starting inline…"
 	}
@@ -1000,6 +1035,9 @@ func renderLogs(item processView) string {
 
 func (m Model) renderFooter() string {
 	item := m.processes[m.selected]
+	if m.viewMode {
+		return m.renderFooterParts(" drag to select · use terminal copy shortcut · v/esc exit", m.version+" · view mode ")
+	}
 	if m.filterEditing {
 		return m.renderFooterParts(" type to filter · enter apply · esc cancel", "filtering ")
 	}
@@ -1008,7 +1046,7 @@ func (m Model) renderFooter() string {
 		mode = "following"
 	}
 	right := fmt.Sprintf("%s · %s · %3.0f%% ", m.version, mode, math.Round(item.viewport.ScrollPercent()*100))
-	left := " ↑/↓ select · r restart · c clear · / filter · pgup/dn · f follow · q quit"
+	left := " ↑/↓ select · r restart · c clear · / filter · pgup/dn · f follow · v view · q quit"
 	if item.logs.normalizedQuery != "" {
 		current := 0
 		if item.matchCursor >= 0 && item.matchCursor < item.logs.occurrenceCount() {

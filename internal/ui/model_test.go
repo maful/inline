@@ -3,6 +3,7 @@ package ui
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -652,7 +653,7 @@ func TestFooterSeparatesHelpAndShowsVersion(t *testing.T) {
 	footer := ansi.Strip(model.renderFooter())
 
 	for _, want := range []string{
-		"↑/↓ select · r restart · c clear · / filter · pgup/dn · f follow · q quit",
+		"↑/↓ select · r restart · c clear · / filter · pgup/dn · f follow · v view · q quit",
 		"v1.2.3 · following · 100% ",
 	} {
 		if !strings.Contains(footer, want) {
@@ -661,6 +662,118 @@ func TestFooterSeparatesHelpAndShowsVersion(t *testing.T) {
 	}
 	if width := lipgloss.Width(footer); width != model.width {
 		t.Errorf("footer width = %d, want %d", width, model.width)
+	}
+}
+
+func TestViewModeFreezesOutputAndRestoresLatestLogsOnExit(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	model = updated.(Model)
+	updated, _ = model.Update(process.Event{Index: 0, Line: "first line"})
+	model = updated.(Model)
+
+	updated, command := model.Update(keyRunes("v"))
+	model = updated.(Model)
+	if !model.viewMode {
+		t.Fatal("view mode is disabled after pressing v")
+	}
+	if command == nil || reflect.TypeOf(command()) != reflect.TypeOf(tea.DisableMouse()) {
+		t.Fatal("entering view mode did not disable mouse reporting")
+	}
+	frozen := model.View()
+	for _, want := range []string{"first line", "drag to select", "v/esc exit", "v1.2.3 · view mode"} {
+		if !strings.Contains(ansi.Strip(frozen), want) {
+			t.Errorf("view mode does not contain %q:\n%s", want, ansi.Strip(frozen))
+		}
+	}
+
+	updated, _ = model.Update(process.Event{Index: 0, Line: "second line"})
+	model = updated.(Model)
+	if model.View() != frozen {
+		t.Fatal("incoming output changed the frozen view mode screen")
+	}
+	if model.processes[0].logs.count() != 2 {
+		t.Fatalf("buffered lines = %d, want 2", model.processes[0].logs.count())
+	}
+
+	updated, command = model.Update(keyRunes("v"))
+	model = updated.(Model)
+	if model.viewMode {
+		t.Fatal("view mode is still enabled after pressing v again")
+	}
+	if command == nil || reflect.TypeOf(command()) != reflect.TypeOf(tea.EnableMouseCellMotion()) {
+		t.Fatal("leaving view mode did not restore mouse reporting")
+	}
+	if view := ansi.Strip(model.View()); !strings.Contains(view, "second line") {
+		t.Fatalf("latest buffered output is missing after leaving view mode:\n%s", view)
+	}
+}
+
+func TestViewModeIgnoresAppShortcutsAndMouseInput(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	model = updated.(Model)
+	updated, _ = model.Update(process.Event{Index: 0, Line: "keep this line"})
+	model = updated.(Model)
+	updated, _ = model.Update(keyRunes("v"))
+	model = updated.(Model)
+
+	updated, command := model.Update(keyRunes("c"))
+	model = updated.(Model)
+	if command != nil || model.processes[0].logs.count() != 1 {
+		t.Fatal("clear shortcut changed logs during view mode")
+	}
+	updated, command = model.Update(keyRunes("r"))
+	model = updated.(Model)
+	if command != nil {
+		t.Fatal("restart shortcut returned a command during view mode")
+	}
+
+	updated, command = model.Update(tea.MouseMsg{
+		X:      1,
+		Y:      headerHeight + panelTopBorderHeight + 1,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	model = updated.(Model)
+	if command != nil || model.selected != 0 {
+		t.Fatal("mouse input changed the selected process during view mode")
+	}
+}
+
+func TestEscapeLeavesViewMode(t *testing.T) {
+	model := newTestModel()
+	model.ready = true
+	model.width = 100
+	model.height = 30
+	model.resize()
+	updated, _ := model.Update(keyRunes("v"))
+	model = updated.(Model)
+
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if model.viewMode {
+		t.Fatal("escape did not leave view mode")
+	}
+	if command == nil || reflect.TypeOf(command()) != reflect.TypeOf(tea.EnableMouseCellMotion()) {
+		t.Fatal("escape did not restore mouse reporting")
+	}
+}
+
+func TestResizeLeavesViewMode(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	model = updated.(Model)
+	updated, _ = model.Update(keyRunes("v"))
+	model = updated.(Model)
+
+	updated, command := model.Update(tea.WindowSizeMsg{Width: 90, Height: 25})
+	model = updated.(Model)
+	if model.viewMode || model.viewModeSnapshot != "" {
+		t.Fatal("resize did not clear view mode")
+	}
+	if command == nil || reflect.TypeOf(command()) != reflect.TypeOf(tea.EnableMouseCellMotion()) {
+		t.Fatal("resize did not restore mouse reporting")
 	}
 }
 
