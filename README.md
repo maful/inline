@@ -113,6 +113,7 @@ go run . -f Procfile.dev
 | `g` / `Home` | Jump to the top and pause following |
 | `G` / `End` | Jump to the bottom and resume following |
 | `f` | Toggle automatic bottom-follow |
+| `v` | Toggle View mode for selecting and copying terminal text |
 | `/` | Edit the selected process's log filter |
 | `Enter` / `Esc` | Apply or cancel a filter edit |
 | `n` / `N` | Select the next or previous filter match |
@@ -120,6 +121,8 @@ go run . -f Procfile.dev
 | `q`, `Ctrl+C` | Stop every process and quit |
 
 Each pane shows the process state, PID, and number of captured lines. Long output wraps to the pane width and reflows when the terminal is resized.
+
+Press `v` to enter View mode. Inline pauses screen updates and returns mouse control to the terminal while processes continue running and their output remains buffered. Drag to select log text, then use the terminal's copy shortcut, such as `Cmd+C` on macOS or `Ctrl+Shift+C` on Linux. Press `v` or `Esc` to return to the live interface and show the latest buffered output. Resizing the terminal also exits View mode.
 
 Filters are case-insensitive literal searches and are kept separately for each process. Filtering only changes the visible lines. Inline retains up to 20,000 lines and 16 MiB of log storage per process, with a 64 MiB limit across all processes. Lines longer than 64 KiB are truncated with a visible marker. ANSI color codes are ignored while matching and preserved when matching lines are displayed.
 
