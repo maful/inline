@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/maful/inline/compare/v0.7.1...v0.8.0) (2026-09-19)
+
+
+### Features
+
+* **ui:** add view mode for copying logs ([#24](https://github.com/maful/inline/issues/24)) ([83ccfe0](https://github.com/maful/inline/commit/83ccfe0063c9a7baf4ca875c02e3b1d77117b27e))
+
 ## [0.7.1](https://github.com/maful/inline/compare/v0.7.0...v0.7.1) (2026-09-12)
 
 
