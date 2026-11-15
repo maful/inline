@@ -12,9 +12,12 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestUpdateInstallsAndActivatesRelease(t *testing.T) {
@@ -122,6 +125,116 @@ func TestUpdateSweepsStaleUpdateDirectories(t *testing.T) {
 	}
 	if _, err := os.Stat(executable); err != nil {
 		t.Fatalf("installed release was removed: %v", err)
+	}
+}
+
+func TestUpdateRefusesToRunDuringInstallation(t *testing.T) {
+	root, executable := createInstallation(t, "v1.0.0-darwin-arm64")
+	lockDirectory := filepath.Join(root, "install.lock")
+	if err := os.Mkdir(lockDirectory, 0o700); err != nil {
+		t.Fatalf("create install lock: %v", err)
+	}
+	// This test process stands in for a running installer.
+	if err := os.WriteFile(filepath.Join(lockDirectory, "pid"), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		t.Fatalf("write install lock owner: %v", err)
+	}
+	archiveName := "inline_darwin_arm64.tar.gz"
+	archive := releaseArchive(t, []byte("new inline binary"))
+	client, releaseAPI := releaseClient("v1.1.0", archiveName, archive, checksumLine(archiveName, archive))
+
+	err := Update(context.Background(), Options{
+		CurrentVersion: "1.0.0",
+		HTTPClient:     client,
+		ReleaseAPI:     releaseAPI,
+		Executable:     executable,
+		GOOS:           "darwin",
+		GOARCH:         "arm64",
+	})
+	if err == nil || !strings.Contains(err.Error(), "installation is already running") {
+		t.Fatalf("update error = %v, want a running installation", err)
+	}
+	if _, err := os.Stat(filepath.Join(lockDirectory, "pid")); err != nil {
+		t.Fatalf("update removed the installer's lock: %v", err)
+	}
+	if current, _ := os.Readlink(filepath.Join(root, "current")); current != filepath.Join("releases", "v1.0.0-darwin-arm64") {
+		t.Fatalf("current link = %q, want it unchanged", current)
+	}
+}
+
+func TestUpdateTakesOverStaleInstallLock(t *testing.T) {
+	for name, prepare := range map[string]func(t *testing.T, lockDirectory string){
+		"owner exited": func(t *testing.T, lockDirectory string) {
+			finished := exec.Command("true")
+			if err := finished.Run(); err != nil {
+				t.Fatalf("run short process: %v", err)
+			}
+			pid := strconv.Itoa(finished.Process.Pid)
+			if err := os.WriteFile(filepath.Join(lockDirectory, "pid"), []byte(pid+"\n"), 0o600); err != nil {
+				t.Fatalf("write install lock owner: %v", err)
+			}
+		},
+		"no owner and old": func(t *testing.T, lockDirectory string) {
+			old := time.Now().Add(-2 * staleInstallLockAge)
+			if err := os.Chtimes(lockDirectory, old, old); err != nil {
+				t.Fatalf("age install lock: %v", err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root, executable := createInstallation(t, "v1.0.0-darwin-arm64")
+			lockDirectory := filepath.Join(root, "install.lock")
+			if err := os.Mkdir(lockDirectory, 0o700); err != nil {
+				t.Fatalf("create install lock: %v", err)
+			}
+			prepare(t, lockDirectory)
+			archiveName := "inline_darwin_arm64.tar.gz"
+			archive := releaseArchive(t, []byte("new inline binary"))
+			client, releaseAPI := releaseClient("v1.1.0", archiveName, archive, checksumLine(archiveName, archive))
+
+			var output bytes.Buffer
+			err := Update(context.Background(), Options{
+				CurrentVersion: "1.0.0",
+				Stdout:         &output,
+				HTTPClient:     client,
+				ReleaseAPI:     releaseAPI,
+				Executable:     executable,
+				GOOS:           "darwin",
+				GOARCH:         "arm64",
+			})
+			if err != nil {
+				t.Fatalf("update: %v", err)
+			}
+			if current, _ := os.Readlink(filepath.Join(root, "current")); current != filepath.Join("releases", "v1.1.0-darwin-arm64") {
+				t.Fatalf("current link = %q, want the new release", current)
+			}
+			if _, err := os.Stat(lockDirectory); !os.IsNotExist(err) {
+				t.Fatalf("install lock still exists after update: stat = %v", err)
+			}
+		})
+	}
+}
+
+func TestUpdateLeavesFreshInstallLockWithoutOwnerAlone(t *testing.T) {
+	root, executable := createInstallation(t, "v1.0.0-darwin-arm64")
+	lockDirectory := filepath.Join(root, "install.lock")
+	if err := os.Mkdir(lockDirectory, 0o700); err != nil {
+		t.Fatalf("create install lock: %v", err)
+	}
+	client, releaseAPI := releaseClient("v1.0.0", "inline_darwin_arm64.tar.gz", nil, "")
+
+	err := Update(context.Background(), Options{
+		CurrentVersion: "1.0.0",
+		HTTPClient:     client,
+		ReleaseAPI:     releaseAPI,
+		Executable:     executable,
+		GOOS:           "darwin",
+		GOARCH:         "arm64",
+	})
+	if err == nil || !strings.Contains(err.Error(), "installation is already running") {
+		t.Fatalf("update error = %v, want a running installation", err)
+	}
+	if _, err := os.Stat(lockDirectory); err != nil {
+		t.Fatalf("update removed a fresh install lock: %v", err)
 	}
 }
 

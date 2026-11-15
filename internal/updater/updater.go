@@ -56,6 +56,11 @@ func Update(ctx context.Context, options Options) error {
 		return err
 	}
 	defer unlock()
+	unlockInstall, err := lockInstall(root)
+	if err != nil {
+		return err
+	}
+	defer unlockInstall()
 	sweepStaleUpdates(root)
 
 	latest, err := fetchRelease(ctx, options)
@@ -199,6 +204,54 @@ func lock(root string) (func(), error) {
 		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
 		_ = file.Close()
 	}, nil
+}
+
+// staleInstallLockAge is how old an install lock with no readable owner must
+// be before it is treated as abandoned.
+const staleInstallLockAge = 10 * time.Minute
+
+// lockInstall takes the lock that install.sh uses: a directory named
+// install.lock holding the owner's process ID. The flock in lock only excludes
+// other updates; this one also excludes the installer, which cannot use flock
+// portably. A lock whose owner has exited is taken over.
+func lockInstall(root string) (func(), error) {
+	directory := filepath.Join(root, "install.lock")
+	for attempt := 0; ; attempt++ {
+		err := os.Mkdir(directory, 0o700)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("create install lock: %w", err)
+		}
+		if attempt > 0 || !installLockStale(directory) {
+			return nil, errors.New("an Inline installation is already running")
+		}
+		if err := os.RemoveAll(directory); err != nil {
+			return nil, fmt.Errorf("remove stale install lock: %w", err)
+		}
+	}
+	release := func() { _ = os.RemoveAll(directory) }
+	if err := os.WriteFile(filepath.Join(directory, "pid"), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		release()
+		return nil, fmt.Errorf("write install lock: %w", err)
+	}
+	return release, nil
+}
+
+func installLockStale(directory string) bool {
+	contents, err := os.ReadFile(filepath.Join(directory, "pid"))
+	if err == nil {
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(contents))); err == nil && pid > 0 {
+			// EPERM means the process exists but belongs to someone else.
+			return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
+		}
+	}
+	info, err := os.Stat(directory)
+	if err != nil {
+		return false
+	}
+	return time.Since(info.ModTime()) > staleInstallLockAge
 }
 
 func fetchRelease(ctx context.Context, options Options) (release, error) {
