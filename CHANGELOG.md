@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.0](https://github.com/maful/inline/compare/v0.7.1...v0.8.0) (2026-11-15)
+
+
+### Features
+
+* **ui:** add view mode for copying logs ([#24](https://github.com/maful/inline/issues/24)) ([83ccfe0](https://github.com/maful/inline/commit/83ccfe0063c9a7baf4ca875c02e3b1d77117b27e))
+
+
+### Bug Fixes
+
+* make implicit state machines explicit ([#26](https://github.com/maful/inline/issues/26)) ([4b26876](https://github.com/maful/inline/commit/4b268767def0840d987c97768c5171d789917b03))
+
 ## [0.7.1](https://github.com/maful/inline/compare/v0.7.0...v0.7.1) (2026-09-12)
 
 
