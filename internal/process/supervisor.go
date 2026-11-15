@@ -86,8 +86,7 @@ type Supervisor struct {
 	processes   []runningProcess
 	events      chan Event
 	stopOnce    sync.Once
-	mu          sync.Mutex
-	stopping    bool
+	stopped     chan struct{}
 	shell       string
 	interactive bool
 }
@@ -105,6 +104,7 @@ func newSupervisor(definitions []procfile.Process, shell string, interactive boo
 		definitions: definitions,
 		processes:   make([]runningProcess, len(definitions)),
 		events:      make(chan Event, eventBufferSize),
+		stopped:     make(chan struct{}),
 		shell:       shell,
 		interactive: interactive,
 	}
@@ -183,14 +183,21 @@ func (s *Supervisor) startLocked(index int, definition procfile.Process, restart
 	if restarted {
 		starting.Line = "inline: restarting…"
 	}
-	s.events <- starting
+	if !s.send(starting) {
+		// Shutdown began before anything was spawned, so there is nothing
+		// for StopAll to signal.
+		item.mu.Lock()
+		item.finish(Failed)
+		item.mu.Unlock()
+		return
+	}
 
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		item.mu.Lock()
 		item.finish(Failed)
 		item.mu.Unlock()
-		s.events <- Event{Index: index, Generation: generation, State: Failed, Err: fmt.Errorf("create output pipe: %w", err)}
+		s.send(Event{Index: index, Generation: generation, State: Failed, Err: fmt.Errorf("create output pipe: %w", err)})
 		return
 	}
 	command.Stdout = writer
@@ -202,14 +209,14 @@ func (s *Supervisor) startLocked(index int, definition procfile.Process, restart
 		item.mu.Lock()
 		item.finish(Failed)
 		item.mu.Unlock()
-		s.events <- Event{Index: index, Generation: generation, State: Failed, Err: err}
+		s.send(Event{Index: index, Generation: generation, State: Failed, Err: err})
 		return
 	}
 
 	item.mu.Lock()
 	item.state = Running
 	item.mu.Unlock()
-	s.events <- Event{Index: index, Generation: generation, State: Running, PID: command.Process.Pid}
+	s.send(Event{Index: index, Generation: generation, State: Running, PID: command.Process.Pid})
 	go s.observe(index, generation, command, reader, writer)
 }
 
@@ -281,10 +288,23 @@ func (s *Supervisor) observe(index int, generation uint64, command *exec.Cmd, re
 		line += fmt.Sprintf("inline: read output: %v", output.err)
 	}
 	if err != nil {
-		s.events <- Event{Index: index, Generation: generation, Line: line, State: Failed, Err: err}
+		s.send(Event{Index: index, Generation: generation, Line: line, State: Failed, Err: err})
 		return
 	}
-	s.events <- Event{Index: index, Generation: generation, Line: line, State: Exited}
+	s.send(Event{Index: index, Generation: generation, Line: line, State: Exited})
+}
+
+// send delivers a lifecycle event, waiting for room in the queue. It gives up
+// and reports false once StopAll has begun: nothing reads events after the UI
+// has quit, and a sender that holds a lifecycle lock would otherwise block
+// StopAll forever.
+func (s *Supervisor) send(event Event) bool {
+	select {
+	case s.events <- event:
+		return true
+	case <-s.stopped:
+		return false
+	}
 }
 
 func (s *Supervisor) sendOutputLine(event Event) bool {
@@ -358,9 +378,7 @@ func formatOutputLine(line []byte, truncated bool) string {
 // StopAll asks every process group to exit, then force-stops any survivors.
 func (s *Supervisor) StopAll() {
 	s.stopOnce.Do(func() {
-		s.mu.Lock()
-		s.stopping = true
-		s.mu.Unlock()
+		close(s.stopped)
 		for index := range s.processes {
 			item := &s.processes[index]
 			item.lifecycle.Lock()
@@ -407,7 +425,7 @@ func (s *Supervisor) stopAndWait(index int) {
 	generation := item.generation
 	item.mu.Unlock()
 
-	s.events <- Event{Index: index, Generation: generation, State: Stopping}
+	s.send(Event{Index: index, Generation: generation, State: Stopping})
 	_ = syscall.Kill(-command.Process.Pid, syscall.SIGTERM)
 
 	timer := time.NewTimer(2 * time.Second)
@@ -422,9 +440,12 @@ func (s *Supervisor) stopAndWait(index int) {
 }
 
 func (s *Supervisor) isStopping() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.stopping
+	select {
+	case <-s.stopped:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Supervisor) anyRunning() bool {

@@ -376,6 +376,104 @@ func TestRestartDuringRestartIsDropped(t *testing.T) {
 	assertStoredState(t, supervisor, 0, Running, 2)
 }
 
+func TestStopAllReturnsWhenRestartIsBlockedOnFullEventQueue(t *testing.T) {
+	supervisor := newSupervisor([]procfile.Process{{Name: "chatty", Command: "yes"}}, "/bin/sh", false)
+	supervisor.StartAll()
+
+	// Nothing reads Events(), as after the UI has quit, so output fills it.
+	deadline := time.Now().Add(3 * time.Second)
+	for len(supervisor.events) < cap(supervisor.events) {
+		if time.Now().After(deadline) {
+			t.Fatal("event queue did not fill")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	item := &supervisor.processes[0]
+	item.mu.Lock()
+	pid := item.command.Process.Pid
+	item.mu.Unlock()
+	t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL) })
+
+	// The restart holds the lifecycle lock while it reports Stopping.
+	go supervisor.Restart(0)
+	for {
+		item.mu.Lock()
+		state := item.state
+		item.mu.Unlock()
+		if state == Stopping {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("restart did not begin stopping the process")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		supervisor.StopAll()
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StopAll hung behind a restart blocked on the full event queue")
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for syscall.Kill(-pid, 0) != syscall.ESRCH {
+		if time.Now().After(deadline) {
+			t.Fatalf("process group %d is still running after StopAll", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestStopAllAbortsStartBlockedOnFullEventQueue(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "spawned")
+	supervisor := newSupervisor([]procfile.Process{{Name: "late", Command: "touch " + marker + "; sleep 5"}}, "/bin/sh", false)
+	for range cap(supervisor.events) {
+		supervisor.events <- Event{Line: "backlog"}
+	}
+
+	started := make(chan struct{})
+	go func() {
+		defer close(started)
+		supervisor.StartAll()
+	}()
+	item := &supervisor.processes[0]
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		item.mu.Lock()
+		state := item.state
+		item.mu.Unlock()
+		if state == Starting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("start did not reach Starting")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		supervisor.StopAll()
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StopAll hung behind a start blocked on the full event queue")
+	}
+	<-started
+
+	assertStoredState(t, supervisor, 0, Failed, 1)
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("command was spawned after shutdown began: stat = %v", err)
+	}
+}
+
 func TestRestartStartsExitedProcess(t *testing.T) {
 	supervisor := newSupervisor([]procfile.Process{{Name: "short", Command: "printf 'done\\n'"}}, "/bin/sh", false)
 	supervisor.StartAll()
