@@ -124,7 +124,7 @@ func TestClearKeyClearsOnlySelectedProcessLogs(t *testing.T) {
 	if got, want := model.processes[0].logs.visibleLines(), []string{"new web error"}; !slices.Equal(got, want) {
 		t.Fatalf("selected process lines after new output = %v, want %v", got, want)
 	}
-	if model.processes[0].logsCleared {
+	if model.processes[0].emptyReason != logsNotEmptied {
 		t.Fatal("selected process remains marked as cleared after new output")
 	}
 }
@@ -407,6 +407,43 @@ func TestModelEvictsOldestEntryAcrossProcessesAtGlobalBudget(t *testing.T) {
 	}
 	if model.retainedLogBytes > model.maxRetainedBytes {
 		t.Fatalf("global retained bytes = %d, want at most %d", model.retainedLogBytes, model.maxRetainedBytes)
+	}
+}
+
+func TestEvictedLogsDoNotClaimProcessNeverWrote(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	model = updated.(Model)
+	model.maxRetainedBytes = 200
+	model.applyEvent(process.Event{Index: 0, State: process.Running, PID: 1234, Line: "web ready"})
+	for range 50 {
+		model.applyEvent(process.Event{Index: 1, Line: "worker tick"})
+	}
+
+	item := model.processes[0]
+	if item.logs.count() != 0 {
+		t.Fatalf("first process retains %d lines, want all evicted", item.logs.count())
+	}
+	if item.emptyReason != logsEvicted {
+		t.Fatalf("empty reason = %d, want logsEvicted", item.emptyReason)
+	}
+	view := ansi.Strip(model.View())
+	if strings.Contains(view, "No output yet") || strings.Contains(view, "waiting for output") {
+		t.Fatalf("view claims the process never wrote:\n%s", view)
+	}
+	if !strings.Contains(view, "dropped this process's earlier output") {
+		t.Fatalf("view does not explain the eviction:\n%s", view)
+	}
+
+	model.applyEvent(process.Event{Index: 0, Line: "web again"})
+	if got := model.processes[0].emptyReason; got != logsNotEmptied {
+		t.Fatalf("empty reason after new output = %d, want logsNotEmptied", got)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	model = updated.(Model)
+	if got := model.processes[0].emptyReason; got != logsClearedByUser {
+		t.Fatalf("empty reason after clear = %d, want logsClearedByUser", got)
 	}
 }
 

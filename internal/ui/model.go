@@ -67,6 +67,17 @@ type processSource interface {
 	Events() <-chan process.Event
 }
 
+// logEmptyReason says why a process's log buffer holds no lines. It is only
+// meaningful while the buffer is empty: appendLine resets it to logsNotEmptied,
+// so an empty buffer with that value has never received a line.
+type logEmptyReason int
+
+const (
+	logsNotEmptied logEmptyReason = iota
+	logsClearedByUser
+	logsEvicted
+)
+
 type processView struct {
 	definition     procfile.Process
 	viewport       viewport.Model
@@ -79,7 +90,7 @@ type processView struct {
 	dirty          bool
 	matchCursor    int
 	activeMatchRow int
-	logsCleared    bool
+	emptyReason    logEmptyReason
 	maxRenderBytes int
 }
 
@@ -268,7 +279,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			item.logs.clear()
 			m.retainedLogBytes = m.totalRetainedLogBytes()
 			item.matchCursor = -1
-			item.logsCleared = true
+			item.emptyReason = logsClearedByUser
 			item.dirty = true
 			m.refreshSelected()
 			return m, nil
@@ -444,7 +455,7 @@ func (m Model) hasStartingProcess() bool {
 
 func (m *Model) appendLine(index int, line string) {
 	item := &m.processes[index]
-	item.logsCleared = false
+	item.emptyReason = logsNotEmptied
 	current, hadCurrent := selectedOccurrence(item)
 	m.nextLogArrival++
 	if item.logs.appendWithArrival(line, m.nextLogArrival) {
@@ -487,6 +498,9 @@ func (m *Model) enforceGlobalLogBudget() {
 		current, hadCurrent := selectedOccurrence(item)
 		entry, changed := item.logs.evictOldest()
 		m.retainedLogBytes -= entry.retainedBytes()
+		if item.logs.count() == 0 {
+			item.emptyReason = logsEvicted
+		}
 		if changed {
 			m.reconcileMatchCursor(item, current, hadCurrent)
 			item.dirty = true
@@ -998,7 +1012,7 @@ func renderStatus(item processView, width int) string {
 	} else {
 		label += fmt.Sprintf(" · %d lines", item.logs.count())
 	}
-	if item.state == process.Running && item.logs.count() == 0 {
+	if item.state == process.Running && item.logs.count() == 0 && item.emptyReason != logsEvicted {
 		label += " · waiting for output"
 	}
 	return style.Render(truncate(label, width))
@@ -1019,18 +1033,18 @@ func renderLogs(item processView) string {
 			Height(item.viewport.Height).
 			Render(fmt.Sprintf("No lines match %q. %s retained.", item.logs.query, retained))
 	}
-	if item.logsCleared {
-		return lipgloss.NewStyle().
-			Foreground(colorMuted).
-			Width(item.viewport.Width).
-			Height(item.viewport.Height).
-			Render("Inline cleared the logs. New output will appear here.")
+	message := "No output yet. The process has not written to stdout or stderr."
+	switch item.emptyReason {
+	case logsClearedByUser:
+		message = "Inline cleared the logs. New output will appear here."
+	case logsEvicted:
+		message = "Inline dropped this process's earlier output to stay within the log memory limit. New output will appear here."
 	}
 	return lipgloss.NewStyle().
 		Foreground(colorMuted).
 		Width(item.viewport.Width).
 		Height(item.viewport.Height).
-		Render("No output yet. The process has not written to stdout or stderr.")
+		Render(message)
 }
 
 func (m Model) renderFooter() string {
