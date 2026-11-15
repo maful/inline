@@ -521,6 +521,40 @@ func TestHighlightRestoresOriginalBackground(t *testing.T) {
 	}
 }
 
+func TestHomeKeyPausesOnlyWhenThereIsOutputBelow(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 60, Height: 12})
+	model = updated.(Model)
+	updated, _ = model.Update(process.Event{Index: 0, Line: "only line"})
+	model = updated.(Model)
+
+	updated, _ = model.Update(keyRunes("g"))
+	model = updated.(Model)
+	if !model.processes[0].follow {
+		t.Fatal("g paused following although all output fits on screen")
+	}
+
+	for index := range 40 {
+		updated, _ = model.Update(process.Event{Index: 0, Line: fmt.Sprintf("line %02d", index)})
+		model = updated.(Model)
+	}
+	if !model.processes[0].viewport.AtBottom() {
+		t.Fatal("viewport stopped following new output after g")
+	}
+
+	updated, _ = model.Update(keyRunes("g"))
+	model = updated.(Model)
+	if item := model.processes[0]; item.follow || item.viewport.YOffset != 0 {
+		t.Fatalf("g with output below: follow=%v offset=%d, want paused at the top", item.follow, item.viewport.YOffset)
+	}
+
+	updated, _ = model.Update(keyRunes("G"))
+	model = updated.(Model)
+	if item := model.processes[0]; !item.follow || !item.viewport.AtBottom() {
+		t.Fatalf("G: follow=%v atBottom=%v, want following at the bottom", item.follow, item.viewport.AtBottom())
+	}
+}
+
 func TestMatchNavigationWrapsAndRevealsCurrentOccurrence(t *testing.T) {
 	model := newTestModel()
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 60, Height: 12})

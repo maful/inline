@@ -115,6 +115,18 @@ const (
 	modeView
 )
 
+// setFollow is the only place that changes follow. Following implies the
+// viewport is at the bottom, so turning it on scrolls there. After the user
+// scrolls, callers pass viewport.AtBottom(): reaching the bottom resumes
+// following and leaving it pauses. f and match navigation pass an explicit
+// value, which is how the view can be paused while at the bottom.
+func (item *processView) setFollow(follow bool) {
+	item.follow = follow
+	if follow {
+		item.viewport.GotoBottom()
+	}
+}
+
 // Model is Inline's Bubble Tea application state.
 type Model struct {
 	processes        []processView
@@ -340,20 +352,16 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "end", "G":
 			item := &m.processes[m.selected]
-			item.follow = true
-			item.viewport.GotoBottom()
+			item.setFollow(true)
 			return m, nil
 		case "home", "g":
 			item := &m.processes[m.selected]
-			item.follow = false
 			item.viewport.GotoTop()
+			item.setFollow(item.viewport.AtBottom())
 			return m, nil
 		case "f":
 			item := &m.processes[m.selected]
-			item.follow = !item.follow
-			if item.follow {
-				item.viewport.GotoBottom()
-			}
+			item.setFollow(!item.follow)
 			return m, nil
 		}
 
@@ -365,12 +373,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 
 		if isScrollKey(message.String()) {
 			item := &m.processes[m.selected]
-			item.follow = false
 			updated, command := item.viewport.Update(message)
 			item.viewport = updated
-			if item.viewport.AtBottom() {
-				item.follow = true
-			}
+			item.setFollow(item.viewport.AtBottom())
 			return m, command
 		}
 
@@ -388,14 +393,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if message.Button == tea.MouseButtonWheelUp || message.Button == tea.MouseButtonWheelDown {
 			item := &m.processes[m.selected]
-			if message.Button == tea.MouseButtonWheelUp {
-				item.follow = false
-			}
 			updated, command := item.viewport.Update(message)
 			item.viewport = updated
-			if item.viewport.AtBottom() {
-				item.follow = true
-			}
+			item.setFollow(item.viewport.AtBottom())
 			return m, command
 		}
 	}
@@ -731,7 +731,7 @@ func (m *Model) navigateMatch(delta int) {
 	} else {
 		item.matchCursor = (item.matchCursor + delta + count) % count
 	}
-	item.follow = false
+	item.setFollow(false)
 	item.dirty = true
 	m.refreshSelected()
 	m.revealActiveMatch(item)
