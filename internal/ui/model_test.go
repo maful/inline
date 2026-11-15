@@ -368,7 +368,7 @@ func TestEscapeCancelsFilterEdit(t *testing.T) {
 	if got := model.processes[0].logs.query; got != "error" {
 		t.Fatalf("query after cancel = %q, want error", got)
 	}
-	if model.filterEditing {
+	if model.mode != modeNormal {
 		t.Fatal("filter remains in editing mode after escape")
 	}
 }
@@ -711,7 +711,7 @@ func TestViewModeFreezesOutputAndRestoresLatestLogsOnExit(t *testing.T) {
 
 	updated, command := model.Update(keyRunes("v"))
 	model = updated.(Model)
-	if !model.viewMode {
+	if model.mode != modeView {
 		t.Fatal("view mode is disabled after pressing v")
 	}
 	if command == nil || reflect.TypeOf(command()) != reflect.TypeOf(tea.DisableMouse()) {
@@ -735,7 +735,7 @@ func TestViewModeFreezesOutputAndRestoresLatestLogsOnExit(t *testing.T) {
 
 	updated, command = model.Update(keyRunes("v"))
 	model = updated.(Model)
-	if model.viewMode {
+	if model.mode != modeNormal {
 		t.Fatal("view mode is still enabled after pressing v again")
 	}
 	if command == nil || reflect.TypeOf(command()) != reflect.TypeOf(tea.EnableMouseCellMotion()) {
@@ -789,7 +789,7 @@ func TestEscapeLeavesViewMode(t *testing.T) {
 
 	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	model = updated.(Model)
-	if model.viewMode {
+	if model.mode != modeNormal {
 		t.Fatal("escape did not leave view mode")
 	}
 	if command == nil || reflect.TypeOf(command()) != reflect.TypeOf(tea.EnableMouseCellMotion()) {
@@ -806,7 +806,7 @@ func TestResizeLeavesViewMode(t *testing.T) {
 
 	updated, command := model.Update(tea.WindowSizeMsg{Width: 90, Height: 25})
 	model = updated.(Model)
-	if model.viewMode || model.viewModeSnapshot != "" {
+	if model.mode != modeNormal || model.viewModeSnapshot != "" {
 		t.Fatal("resize did not clear view mode")
 	}
 	if command == nil || reflect.TypeOf(command()) != reflect.TypeOf(tea.EnableMouseCellMotion()) {

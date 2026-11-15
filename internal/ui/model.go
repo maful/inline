@@ -94,6 +94,27 @@ type processView struct {
 	maxRenderBytes int
 }
 
+// inputMode says where key and mouse input goes. Every change goes through
+// setMode, which keeps the fields that belong to a mode, and the terminal's
+// mouse reporting, in step with it:
+//
+//	modeNormal → modeFilter   /
+//	modeFilter → modeNormal   enter (keep the query), esc (restore it)
+//	modeNormal → modeView     v
+//	modeView   → modeNormal   v, esc, terminal resize
+type inputMode int
+
+const (
+	// modeNormal sends input to the app's shortcuts.
+	modeNormal inputMode = iota
+	// modeFilter sends keys to the filter input of the selected process.
+	// filterOriginal holds the query to restore on cancel.
+	modeFilter
+	// modeView freezes the screen in viewModeSnapshot and turns mouse
+	// reporting off so the terminal can select text.
+	modeView
+)
+
 // Model is Inline's Bubble Tea application state.
 type Model struct {
 	processes        []processView
@@ -108,10 +129,8 @@ type Model struct {
 	ready            bool
 	startupSpinner   spinner.Model
 	filterInput      textinput.Model
-	filterEditing    bool
-	filterProcess    int
+	mode             inputMode
 	filterOriginal   string
-	viewMode         bool
 	viewModeSnapshot string
 	nextLogArrival   uint64
 	retainedLogBytes int
@@ -152,7 +171,6 @@ func New(definitions []procfile.Process, source processSource, path, workingDire
 		version:          sanitizeDisplayText(version),
 		startupSpinner:   startupSpinner,
 		filterInput:      filterInput,
-		filterProcess:    -1,
 		maxRetainedBytes: maxTotalLogBytes,
 	}
 }
@@ -210,17 +228,15 @@ func waitForEvent(events <-chan process.Event) tea.Cmd {
 func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch message := message.(type) {
 	case tea.WindowSizeMsg:
-		wasViewMode := m.viewMode
-		m.viewMode = false
-		m.viewModeSnapshot = ""
+		var command tea.Cmd
+		if m.mode == modeView {
+			command = m.setMode(modeNormal)
+		}
 		m.width = message.Width
 		m.height = message.Height
 		m.ready = true
 		m.resize()
-		if wasViewMode {
-			return m, tea.EnableMouseCellMotion
-		}
-		return m, nil
+		return m, command
 
 	case process.Event:
 		wasStarting := m.hasStartingProcess()
@@ -254,20 +270,19 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if message.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
-		if m.viewMode {
+		switch m.mode {
+		case modeView:
 			switch message.String() {
 			case "v", "esc":
-				m.viewMode = false
-				m.viewModeSnapshot = ""
+				command := m.setMode(modeNormal)
 				m.refreshSelected()
-				return m, tea.EnableMouseCellMotion
+				return m, command
 			case "q":
 				return m, tea.Quit
 			default:
 				return m, nil
 			}
-		}
-		if m.filterEditing {
+		case modeFilter:
 			return m.updateFilterInput(message)
 		}
 
@@ -290,11 +305,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				return nil
 			}
 		case "v":
-			m.viewMode = true
-			m.viewModeSnapshot = m.renderView()
-			return m, tea.DisableMouse
+			return m, m.setMode(modeView)
 		case "/":
-			return m, m.beginFilter()
+			return m, m.setMode(modeFilter)
 		case "esc":
 			item := &m.processes[m.selected]
 			if item.logs.setQuery("") {
@@ -362,10 +375,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.MouseMsg:
-		if m.viewMode {
-			return m, nil
-		}
-		if m.filterEditing {
+		if m.mode != modeNormal {
 			return m, nil
 		}
 		if message.Action == tea.MouseActionPress && message.Button == tea.MouseButtonLeft {
@@ -394,7 +404,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) View() string {
-	if m.viewMode && m.viewModeSnapshot != "" {
+	if m.mode == modeView {
 		return m.viewModeSnapshot
 	}
 	return m.renderView()
@@ -508,31 +518,55 @@ func (m *Model) enforceGlobalLogBudget() {
 	}
 }
 
-func (m *Model) beginFilter() tea.Cmd {
-	item := &m.processes[m.selected]
-	m.filterEditing = true
-	m.filterProcess = m.selected
-	m.filterOriginal = item.logs.query
-	m.filterInput.SetValue(item.logs.query)
-	m.filterInput.CursorEnd()
-	return m.filterInput.Focus()
-}
-
-func (m *Model) updateFilterInput(message tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if m.filterProcess < 0 || m.filterProcess >= len(m.processes) {
-		m.filterEditing = false
-		m.filterProcess = -1
-		m.filterInput.Blur()
-		return *m, nil
+// setMode is the only place that changes the input mode. It tears down the
+// mode being left, sets up the one being entered, and returns the command the
+// terminal needs for the change, if any.
+func (m *Model) setMode(next inputMode) tea.Cmd {
+	if next == m.mode {
+		return nil
 	}
 
-	item := &m.processes[m.filterProcess]
+	var leave tea.Cmd
+	switch m.mode {
+	case modeFilter:
+		m.filterOriginal = ""
+		m.filterInput.Blur()
+	case modeView:
+		m.viewModeSnapshot = ""
+		leave = tea.EnableMouseCellMotion
+	}
+
+	m.mode = next
+	var enter tea.Cmd
+	switch next {
+	case modeFilter:
+		query := m.processes[m.selected].logs.query
+		m.filterOriginal = query
+		m.filterInput.SetValue(query)
+		m.filterInput.CursorEnd()
+		enter = m.filterInput.Focus()
+	case modeView:
+		// Rendered after the mode change so the snapshot shows the view-mode footer.
+		m.viewModeSnapshot = m.renderView()
+		enter = tea.DisableMouse
+	}
+
+	if leave == nil {
+		return enter
+	}
+	if enter == nil {
+		return leave
+	}
+	return tea.Sequence(leave, enter)
+}
+
+// updateFilterInput handles a key in modeFilter. Selection cannot change in
+// that mode, so the filter being edited always belongs to the selected process.
+func (m *Model) updateFilterInput(message tea.KeyMsg) (tea.Model, tea.Cmd) {
+	item := &m.processes[m.selected]
 	switch message.String() {
 	case "enter":
-		m.filterEditing = false
-		m.filterProcess = -1
-		m.filterInput.Blur()
-		return *m, nil
+		return *m, m.setMode(modeNormal)
 	case "esc":
 		if item.logs.setQuery(m.filterOriginal) {
 			m.resetMatchCursor(item)
@@ -540,10 +574,7 @@ func (m *Model) updateFilterInput(message tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.refreshSelected()
 			m.revealActiveMatch(item)
 		}
-		m.filterEditing = false
-		m.filterProcess = -1
-		m.filterInput.Blur()
-		return *m, nil
+		return *m, m.setMode(modeNormal)
 	}
 
 	input, command := m.filterInput.Update(message)
@@ -993,7 +1024,7 @@ func (m Model) renderPanel() string {
 	innerWidth := max(1, mainWidth-4)
 	command := commandStyle.Render(truncate("$ "+item.definition.Command, innerWidth))
 	status := renderStatus(item, innerWidth)
-	if m.filterEditing && m.filterProcess == m.selected {
+	if m.mode == modeFilter {
 		status = m.filterInput.View()
 	}
 	divider := mutedStyle.Render(strings.Repeat("─", innerWidth))
@@ -1049,10 +1080,10 @@ func renderLogs(item processView) string {
 
 func (m Model) renderFooter() string {
 	item := m.processes[m.selected]
-	if m.viewMode {
+	if m.mode == modeView {
 		return m.renderFooterParts(" drag to select · use terminal copy shortcut · v/esc exit", m.version+" · view mode ")
 	}
-	if m.filterEditing {
+	if m.mode == modeFilter {
 		return m.renderFooterParts(" type to filter · enter apply · esc cancel", "filtering ")
 	}
 	mode := "paused"
