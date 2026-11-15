@@ -59,7 +59,8 @@ func (state State) alive() bool { return state == Running || state == Stopping }
 //	Stopping → Exited                       observe
 //
 // command and done are set exactly while state is Starting, Running, or
-// Stopping. lifecycle serializes whole start and restart sequences; mu guards
+// Stopping. startLocked refuses a record in any of those states, so a record
+// is never replaced while its observer is still running. lifecycle serializes whole start and restart sequences; mu guards
 // the fields below it.
 type runningProcess struct {
 	lifecycle  sync.Mutex
@@ -147,7 +148,17 @@ func (s *Supervisor) start(index int, definition procfile.Process, restarted boo
 	s.startLocked(index, definition, restarted)
 }
 
+// startLocked launches the command unless the record is still live. The caller
+// must hold the record's lifecycle lock.
 func (s *Supervisor) startLocked(index int, definition procfile.Process, restarted bool) {
+	item := &s.processes[index]
+	item.mu.Lock()
+	if item.state == Starting || item.state.alive() {
+		item.mu.Unlock()
+		return
+	}
+	item.mu.Unlock()
+
 	command := s.buildCommand(definition.Command)
 	// Interactive shells try to access their controlling terminal for job
 	// control. Because each managed command runs in the background, that can
@@ -156,14 +167,12 @@ func (s *Supervisor) startLocked(index int, definition procfile.Process, restart
 	// its process-group ID, preserving grouped shutdown via kill(-pid, signal).
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
-	item := &s.processes[index]
 	item.mu.Lock()
 	item.generation++
 	generation := item.generation
 	item.state = Starting
 	item.command = command
 	item.done = make(chan struct{})
-	done := item.done
 	item.mu.Unlock()
 
 	starting := Event{Index: index, Generation: generation, State: Starting}
@@ -197,7 +206,7 @@ func (s *Supervisor) startLocked(index int, definition procfile.Process, restart
 	item.state = Running
 	item.mu.Unlock()
 	s.events <- Event{Index: index, Generation: generation, State: Running, PID: command.Process.Pid}
-	go s.observe(index, generation, command, done, reader, writer)
+	go s.observe(index, generation, command, reader, writer)
 }
 
 func (s *Supervisor) buildCommand(script string) *exec.Cmd {
@@ -208,7 +217,7 @@ func (s *Supervisor) buildCommand(script string) *exec.Cmd {
 	return exec.Command(s.shell, flag, script)
 }
 
-func (s *Supervisor) observe(index int, generation uint64, command *exec.Cmd, done chan struct{}, reader *os.File, writer *os.File) {
+func (s *Supervisor) observe(index int, generation uint64, command *exec.Cmd, reader *os.File, writer *os.File) {
 	type outputResult struct {
 		dropped int
 		err     error
@@ -245,16 +254,10 @@ func (s *Supervisor) observe(index int, generation uint64, command *exec.Cmd, do
 
 	item := &s.processes[index]
 	item.mu.Lock()
-	// An observer whose generation was replaced without being reaped must not
-	// touch the newer generation's state.
-	current := item.command == command && item.generation == generation
-	stopped := current && item.state == Stopping
-	switch {
-	case !current:
-		close(done)
-	case stopped || err == nil:
+	stopped := item.state == Stopping
+	if stopped || err == nil {
 		item.finish(Exited)
-	default:
+	} else {
 		item.finish(Failed)
 	}
 	item.mu.Unlock()

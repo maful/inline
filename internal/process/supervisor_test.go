@@ -280,6 +280,33 @@ func TestSupervisorStoresFailedStateWhenStartFails(t *testing.T) {
 	assertStoredState(t, supervisor, 0, Failed, 1)
 }
 
+func TestStartAllLeavesLiveProcessAlone(t *testing.T) {
+	supervisor := newSupervisor([]procfile.Process{
+		{Name: "long", Command: "trap 'exit 0' TERM; while :; do sleep 1; done"},
+	}, "/bin/sh", false)
+	supervisor.StartAll()
+	t.Cleanup(supervisor.StopAll)
+	running := waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
+		return event.State == Running
+	})
+
+	supervisor.StartAll()
+
+	assertStoredState(t, supervisor, 0, Running, 1)
+	item := &supervisor.processes[0]
+	item.mu.Lock()
+	pid := item.command.Process.Pid
+	item.mu.Unlock()
+	if pid != running.PID {
+		t.Fatalf("stored pid after second StartAll = %d, want the original %d", pid, running.PID)
+	}
+	select {
+	case event := <-supervisor.Events():
+		t.Fatalf("second StartAll emitted %+v, want no event", event)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 // assertStoredState checks the supervisor's own record, including the
 // invariant that command and done exist exactly while a process is live.
 func assertStoredState(t *testing.T, supervisor *Supervisor, index int, want State, wantGeneration uint64) {
