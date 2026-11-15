@@ -56,6 +56,7 @@ func Update(ctx context.Context, options Options) error {
 		return err
 	}
 	defer unlock()
+	sweepStaleUpdates(root)
 
 	latest, err := fetchRelease(ctx, options)
 	if err != nil {
@@ -91,7 +92,7 @@ func Update(ctx context.Context, options Options) error {
 	}
 
 	fmt.Fprintf(options.Stdout, "Updating Inline %s -> %s\n", displayVersion(options.CurrentVersion), displayVersion(latest.TagName))
-	temporaryDir, err := os.MkdirTemp(filepath.Join(root, "releases"), ".update-")
+	temporaryDir, err := os.MkdirTemp(filepath.Join(root, "releases"), updateDirPrefix)
 	if err != nil {
 		return fmt.Errorf("create update directory: %w", err)
 	}
@@ -163,6 +164,26 @@ func installRoot(executable string) (string, error) {
 		return "", errors.New("this standalone binary is not managed by the Inline installer; reinstall with install.sh")
 	}
 	return filepath.Dir(releasesDir), nil
+}
+
+// updateDirPrefix names the staging directories Update creates under releases.
+const updateDirPrefix = ".update-"
+
+// sweepStaleUpdates removes staging directories left behind by an update that
+// was killed before its cleanup ran. The caller must hold the update lock, so
+// no running update can own one. Failures are ignored: a leftover directory
+// wastes space but does not affect the installation.
+func sweepStaleUpdates(root string) {
+	releasesDir := filepath.Join(root, "releases")
+	entries, err := os.ReadDir(releasesDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), updateDirPrefix) {
+			_ = os.RemoveAll(filepath.Join(releasesDir, entry.Name()))
+		}
+	}
 }
 
 func lock(root string) (func(), error) {

@@ -82,6 +82,49 @@ func TestUpdateRejectsChecksumMismatch(t *testing.T) {
 	}
 }
 
+func TestUpdateSweepsStaleUpdateDirectories(t *testing.T) {
+	root, executable := createInstallation(t, "v1.0.0-darwin-arm64")
+	releasesDir := filepath.Join(root, "releases")
+	stale := filepath.Join(releasesDir, ".update-123456")
+	if err := os.MkdirAll(filepath.Join(stale, "release", "bin"), 0o755); err != nil {
+		t.Fatalf("create stale update directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stale, "inline_darwin_arm64.tar.gz"), []byte("partial download"), 0o644); err != nil {
+		t.Fatalf("write stale archive: %v", err)
+	}
+	installerStaging := filepath.Join(releasesDir, ".install.abcdef")
+	if err := os.Mkdir(installerStaging, 0o755); err != nil {
+		t.Fatalf("create installer staging directory: %v", err)
+	}
+	archiveName := "inline_darwin_arm64.tar.gz"
+	// Already up to date: the sweep must not depend on an update being needed.
+	client, releaseAPI := releaseClient("v1.0.0", archiveName, nil, "")
+
+	var output bytes.Buffer
+	err := Update(context.Background(), Options{
+		CurrentVersion: "1.0.0",
+		Stdout:         &output,
+		HTTPClient:     client,
+		ReleaseAPI:     releaseAPI,
+		Executable:     executable,
+		GOOS:           "darwin",
+		GOARCH:         "arm64",
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale update directory still exists: stat = %v", err)
+	}
+	if _, err := os.Stat(installerStaging); err != nil {
+		t.Fatalf("installer staging directory was removed: %v", err)
+	}
+	if _, err := os.Stat(executable); err != nil {
+		t.Fatalf("installed release was removed: %v", err)
+	}
+}
+
 func TestCompareVersions(t *testing.T) {
 	tests := []struct {
 		left  string
