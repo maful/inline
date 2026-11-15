@@ -88,7 +88,8 @@ type processView struct {
 	generation     uint64
 	follow         bool
 	dirty          bool
-	matchCursor    int
+	pinnedMatch    matchSpan
+	hasPinnedMatch bool
 	activeMatchRow int
 	emptyReason    logEmptyReason
 	maxRenderBytes int
@@ -120,11 +121,57 @@ const (
 // scrolls, callers pass viewport.AtBottom(): reaching the bottom resumes
 // following and leaving it pauses. f and match navigation pass an explicit
 // value, which is how the view can be paused while at the bottom.
+//
+// follow also decides the selected match (see selectedOccurrence), so pausing
+// pins the match that was selected and resuming drops the pin.
 func (item *processView) setFollow(follow bool) {
+	if follow != item.follow {
+		if follow {
+			item.clearPinnedMatch()
+		} else {
+			span, _, ok := item.selectedOccurrence()
+			item.pinnedMatch, item.hasPinnedMatch = span, ok
+		}
+		if item.logs.normalizedQuery != "" {
+			item.dirty = true
+		}
+	}
 	item.follow = follow
 	if follow {
 		item.viewport.GotoBottom()
 	}
+}
+
+func (item *processView) clearPinnedMatch() {
+	item.pinnedMatch, item.hasPinnedMatch = matchSpan{}, false
+}
+
+// selectedOccurrence derives the selected match and its position among the
+// indexed occurrences. Nothing has to be updated when lines are appended or
+// evicted:
+//
+//	no indexed occurrences            none
+//	following, index capped           none (the newest match is not indexed)
+//	following                         the newest occurrence
+//	paused, pinned match still held   the pinned match
+//	paused otherwise                  the oldest occurrence
+func (item *processView) selectedOccurrence() (span matchSpan, index int, ok bool) {
+	occurrences := item.logs.activeOccurrences()
+	if len(occurrences) == 0 {
+		return matchSpan{}, -1, false
+	}
+	if item.follow {
+		if item.logs.occurrencesLimited() {
+			return matchSpan{}, -1, false
+		}
+		return occurrences[len(occurrences)-1], len(occurrences) - 1, true
+	}
+	if item.hasPinnedMatch {
+		if index := item.logs.occurrenceIndex(item.pinnedMatch); index >= 0 {
+			return item.pinnedMatch, index, true
+		}
+	}
+	return occurrences[0], 0, true
 }
 
 // Model is Inline's Bubble Tea application state.
@@ -169,7 +216,6 @@ func New(definitions []procfile.Process, source processSource, path, workingDire
 			state:          process.Starting,
 			follow:         true,
 			dirty:          true,
-			matchCursor:    -1,
 			activeMatchRow: -1,
 			maxRenderBytes: maxRenderedLogBytes,
 		}
@@ -305,7 +351,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			item := &m.processes[m.selected]
 			item.logs.clear()
 			m.retainedLogBytes = m.totalRetainedLogBytes()
-			item.matchCursor = -1
+			item.clearPinnedMatch()
 			item.emptyReason = logsClearedByUser
 			item.dirty = true
 			m.refreshSelected()
@@ -323,7 +369,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case "esc":
 			item := &m.processes[m.selected]
 			if item.logs.setQuery("") {
-				item.matchCursor = -1
+				item.clearPinnedMatch()
 				item.dirty = true
 				m.refreshSelected()
 			}
@@ -353,15 +399,18 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case "end", "G":
 			item := &m.processes[m.selected]
 			item.setFollow(true)
+			m.refreshSelected()
 			return m, nil
 		case "home", "g":
 			item := &m.processes[m.selected]
 			item.viewport.GotoTop()
 			item.setFollow(item.viewport.AtBottom())
+			m.refreshSelected()
 			return m, nil
 		case "f":
 			item := &m.processes[m.selected]
 			item.setFollow(!item.follow)
+			m.refreshSelected()
 			return m, nil
 		}
 
@@ -376,6 +425,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			updated, command := item.viewport.Update(message)
 			item.viewport = updated
 			item.setFollow(item.viewport.AtBottom())
+			m.refreshSelected()
 			return m, command
 		}
 
@@ -396,6 +446,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			updated, command := item.viewport.Update(message)
 			item.viewport = updated
 			item.setFollow(item.viewport.AtBottom())
+			m.refreshSelected()
 			return m, command
 		}
 	}
@@ -466,10 +517,8 @@ func (m Model) hasStartingProcess() bool {
 func (m *Model) appendLine(index int, line string) {
 	item := &m.processes[index]
 	item.emptyReason = logsNotEmptied
-	current, hadCurrent := selectedOccurrence(item)
 	m.nextLogArrival++
 	if item.logs.appendWithArrival(line, m.nextLogArrival) {
-		m.reconcileMatchCursor(item, current, hadCurrent)
 		item.dirty = true
 	}
 	m.retainedLogBytes = m.totalRetainedLogBytes()
@@ -505,14 +554,12 @@ func (m *Model) enforceGlobalLogBudget() {
 		}
 
 		item := &m.processes[oldestIndex]
-		current, hadCurrent := selectedOccurrence(item)
 		entry, changed := item.logs.evictOldest()
 		m.retainedLogBytes -= entry.retainedBytes()
 		if item.logs.count() == 0 {
 			item.emptyReason = logsEvicted
 		}
 		if changed {
-			m.reconcileMatchCursor(item, current, hadCurrent)
 			item.dirty = true
 		}
 	}
@@ -569,7 +616,7 @@ func (m *Model) updateFilterInput(message tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return *m, m.setMode(modeNormal)
 	case "esc":
 		if item.logs.setQuery(m.filterOriginal) {
-			m.resetMatchCursor(item)
+			item.clearPinnedMatch()
 			item.dirty = true
 			m.refreshSelected()
 			m.revealActiveMatch(item)
@@ -580,7 +627,7 @@ func (m *Model) updateFilterInput(message tea.KeyMsg) (tea.Model, tea.Cmd) {
 	input, command := m.filterInput.Update(message)
 	m.filterInput = input
 	if item.logs.setQuery(m.filterInput.Value()) {
-		m.resetMatchCursor(item)
+		item.clearPinnedMatch()
 		item.dirty = true
 		m.refreshSelected()
 		m.revealActiveMatch(item)
@@ -601,7 +648,8 @@ func (m *Model) refreshViewport(item *processView) {
 	}
 	entries := item.logs.visibleEntries()
 	end := len(entries)
-	if current, ok := selectedOccurrence(item); ok {
+	current, currentIndex, hasCurrent := item.selectedOccurrence()
+	if hasCurrent {
 		for index, entry := range entries {
 			if entry.sequence == current.sequence {
 				end = index + 1
@@ -626,8 +674,8 @@ func (m *Model) refreshViewport(item *processView) {
 		entry := entries[index]
 		spans, start := item.logs.occurrencesFor(entry.sequence)
 		active := -1
-		if item.matchCursor >= start && item.matchCursor < start+len(spans) {
-			active = item.matchCursor - start
+		if hasCurrent && currentIndex >= start && currentIndex < start+len(spans) {
+			active = currentIndex - start
 		}
 		line := highlightLogLine(entry.raw, spans, active)
 		wrapped := wrapLogLine(line, item.viewport.Width)
@@ -669,54 +717,6 @@ func (m *Model) refreshViewport(item *processView) {
 	}
 }
 
-func selectedOccurrence(item *processView) (matchSpan, bool) {
-	occurrences := item.logs.activeOccurrences()
-	if item.matchCursor < 0 || item.matchCursor >= len(occurrences) {
-		return matchSpan{}, false
-	}
-	return occurrences[item.matchCursor], true
-}
-
-func (m *Model) resetMatchCursor(item *processView) {
-	count := item.logs.occurrenceCount()
-	if count == 0 {
-		item.matchCursor = -1
-		return
-	}
-	if item.follow {
-		if item.logs.occurrencesLimited() {
-			item.matchCursor = -1
-			return
-		}
-		item.matchCursor = count - 1
-		return
-	}
-	item.matchCursor = 0
-}
-
-func (m *Model) reconcileMatchCursor(item *processView, current matchSpan, hadCurrent bool) {
-	count := item.logs.occurrenceCount()
-	if count == 0 {
-		item.matchCursor = -1
-		return
-	}
-	if item.follow {
-		if item.logs.occurrencesLimited() {
-			item.matchCursor = -1
-			return
-		}
-		item.matchCursor = count - 1
-		return
-	}
-	if hadCurrent {
-		if index := item.logs.occurrenceIndex(current); index >= 0 {
-			item.matchCursor = index
-			return
-		}
-	}
-	item.matchCursor = min(max(item.matchCursor, 0), count-1)
-}
-
 func (m *Model) navigateMatch(delta int) {
 	if len(m.processes) == 0 {
 		return
@@ -726,12 +726,12 @@ func (m *Model) navigateMatch(delta int) {
 	if item.logs.normalizedQuery == "" || count == 0 {
 		return
 	}
-	if item.matchCursor < 0 || item.matchCursor >= count {
-		item.matchCursor = 0
-	} else {
-		item.matchCursor = (item.matchCursor + delta + count) % count
+	next := 0
+	if _, index, ok := item.selectedOccurrence(); ok {
+		next = (index + delta + count) % count
 	}
 	item.setFollow(false)
+	item.pinnedMatch, item.hasPinnedMatch = item.logs.activeOccurrences()[next], true
 	item.dirty = true
 	m.refreshSelected()
 	m.revealActiveMatch(item)
@@ -1094,8 +1094,8 @@ func (m Model) renderFooter() string {
 	left := " ↑/↓ select · r restart · c clear · / filter · pgup/dn · f follow · v view · q quit"
 	if item.logs.normalizedQuery != "" {
 		current := 0
-		if item.matchCursor >= 0 && item.matchCursor < item.logs.occurrenceCount() {
-			current = item.matchCursor + 1
+		if _, index, ok := item.selectedOccurrence(); ok {
+			current = index + 1
 		}
 		if item.logs.occurrencesLimited() {
 			left = fmt.Sprintf(" [%d/%d indexed · %d total] matches · navigation limited · c clear · n/N move · esc clear filter", current, item.logs.occurrenceCount(), item.logs.totalOccurrenceCount())
