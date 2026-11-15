@@ -223,10 +223,81 @@ func TestRestartReplacesSelectedProcess(t *testing.T) {
 		otherPID = otherItem.command.Process.Pid
 	}
 	otherGeneration := otherItem.generation
-	otherRunning := otherItem.running
+	otherState := otherItem.state
 	otherItem.mu.Unlock()
-	if !otherRunning || otherPID != other.PID || otherGeneration != 1 {
-		t.Fatalf("other process changed: running=%t, pid=%d, generation=%d", otherRunning, otherPID, otherGeneration)
+	if otherState != Running || otherPID != other.PID || otherGeneration != 1 {
+		t.Fatalf("other process changed: state=%q, pid=%d, generation=%d", otherState, otherPID, otherGeneration)
+	}
+}
+
+func TestSupervisorStoresLifecycleState(t *testing.T) {
+	const loop = "trap 'exit 0' TERM; while :; do sleep 1; done"
+	supervisor := newSupervisor([]procfile.Process{
+		{Name: "long", Command: loop},
+		{Name: "clean", Command: "exit 0"},
+		{Name: "broken", Command: "exit 3"},
+	}, "/bin/sh", false)
+
+	for index := range supervisor.processes {
+		assertStoredState(t, supervisor, index, notStarted, 0)
+	}
+
+	supervisor.StartAll()
+	t.Cleanup(supervisor.StopAll)
+	pending := map[int]State{0: Running, 1: Exited, 2: Failed}
+	waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
+		if pending[event.Index] == event.State {
+			delete(pending, event.Index)
+		}
+		return len(pending) == 0
+	})
+	assertStoredState(t, supervisor, 0, Running, 1)
+	assertStoredState(t, supervisor, 1, Exited, 1)
+	assertStoredState(t, supervisor, 2, Failed, 1)
+
+	supervisor.Restart(0)
+	assertStoredState(t, supervisor, 0, Running, 2)
+
+	supervisor.StopAll()
+	assertStoredState(t, supervisor, 0, Exited, 2)
+}
+
+func TestSupervisorStoresFailedStateWhenStartFails(t *testing.T) {
+	supervisor := newSupervisor(
+		[]procfile.Process{{Name: "missing", Command: "true"}},
+		filepath.Join(t.TempDir(), "no-such-shell"),
+		false,
+	)
+	supervisor.StartAll()
+	t.Cleanup(supervisor.StopAll)
+
+	failed := waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
+		return event.State == Failed
+	})
+	if failed.Err == nil {
+		t.Fatal("failed start event has no error")
+	}
+	assertStoredState(t, supervisor, 0, Failed, 1)
+}
+
+// assertStoredState checks the supervisor's own record, including the
+// invariant that command and done exist exactly while a process is live.
+func assertStoredState(t *testing.T, supervisor *Supervisor, index int, want State, wantGeneration uint64) {
+	t.Helper()
+	item := &supervisor.processes[index]
+	item.mu.Lock()
+	state := item.state
+	generation := item.generation
+	hasCommand := item.command != nil
+	hasDone := item.done != nil
+	item.mu.Unlock()
+
+	if state != want || generation != wantGeneration {
+		t.Fatalf("process %d: state=%q generation=%d, want %q generation %d", index, state, generation, want, wantGeneration)
+	}
+	live := want == Starting || want.alive()
+	if hasCommand != live || hasDone != live {
+		t.Fatalf("process %d in state %q: command set=%t, done set=%t, want both %t", index, state, hasCommand, hasDone, live)
 	}
 }
 
