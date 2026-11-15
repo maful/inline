@@ -49,8 +49,39 @@ cleanup() {
     rm -rf "$staged_release"
   fi
   if [ "$lock_acquired" = "true" ]; then
-    rmdir "$lock_directory" 2>/dev/null || true
+    rm -rf "$lock_directory"
   fi
+}
+
+# The lock is a directory holding the owner's process ID. "inline update" takes
+# the same lock, so an installation and an update never run over one root.
+# A lock is stale when its owner has exited, or when it has no readable owner
+# and is more than 10 minutes old.
+lock_is_stale() {
+  owner=""
+  if [ -f "${lock_directory}/pid" ]; then
+    owner="$(cat "${lock_directory}/pid" 2>/dev/null || true)"
+  fi
+  case "$owner" in
+    "" | *[!0-9]*)
+      [ -n "$(find "$lock_directory" -maxdepth 0 -mmin +10 2>/dev/null)" ]
+      ;;
+    *)
+      ! kill -0 "$owner" 2>/dev/null
+      ;;
+  esac
+}
+
+acquire_lock() {
+  if ! mkdir "$lock_directory" 2>/dev/null; then
+    if ! lock_is_stale; then
+      fail "another Inline installation or update is running"
+    fi
+    rm -rf "$lock_directory"
+    mkdir "$lock_directory" 2>/dev/null || fail "another Inline installation or update is running"
+  fi
+  lock_acquired="true"
+  printf '%s\n' "$$" >"${lock_directory}/pid"
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -61,10 +92,7 @@ fi
 if [ -e "${bin_directory}/inline" ] && [ ! -L "${bin_directory}/inline" ]; then
   fail "${bin_directory}/inline already exists and is not a symbolic link"
 fi
-if ! mkdir "$lock_directory" 2>/dev/null; then
-  fail "another installation is running; remove ${lock_directory} if it is stale"
-fi
-lock_acquired="true"
+acquire_lock
 
 printf 'Downloading Inline for %s/%s...\n' "$operating_system" "$architecture"
 download "${release_base_url}/${archive_name}" "${temporary_directory}/${archive_name}"

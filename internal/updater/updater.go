@@ -56,6 +56,12 @@ func Update(ctx context.Context, options Options) error {
 		return err
 	}
 	defer unlock()
+	unlockInstall, err := lockInstall(root)
+	if err != nil {
+		return err
+	}
+	defer unlockInstall()
+	sweepStaleUpdates(root)
 
 	latest, err := fetchRelease(ctx, options)
 	if err != nil {
@@ -91,7 +97,7 @@ func Update(ctx context.Context, options Options) error {
 	}
 
 	fmt.Fprintf(options.Stdout, "Updating Inline %s -> %s\n", displayVersion(options.CurrentVersion), displayVersion(latest.TagName))
-	temporaryDir, err := os.MkdirTemp(filepath.Join(root, "releases"), ".update-")
+	temporaryDir, err := os.MkdirTemp(filepath.Join(root, "releases"), updateDirPrefix)
 	if err != nil {
 		return fmt.Errorf("create update directory: %w", err)
 	}
@@ -165,6 +171,26 @@ func installRoot(executable string) (string, error) {
 	return filepath.Dir(releasesDir), nil
 }
 
+// updateDirPrefix names the staging directories Update creates under releases.
+const updateDirPrefix = ".update-"
+
+// sweepStaleUpdates removes staging directories left behind by an update that
+// was killed before its cleanup ran. The caller must hold the update lock, so
+// no running update can own one. Failures are ignored: a leftover directory
+// wastes space but does not affect the installation.
+func sweepStaleUpdates(root string) {
+	releasesDir := filepath.Join(root, "releases")
+	entries, err := os.ReadDir(releasesDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), updateDirPrefix) {
+			_ = os.RemoveAll(filepath.Join(releasesDir, entry.Name()))
+		}
+	}
+}
+
 func lock(root string) (func(), error) {
 	file, err := os.OpenFile(filepath.Join(root, "update.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -178,6 +204,54 @@ func lock(root string) (func(), error) {
 		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
 		_ = file.Close()
 	}, nil
+}
+
+// staleInstallLockAge is how old an install lock with no readable owner must
+// be before it is treated as abandoned.
+const staleInstallLockAge = 10 * time.Minute
+
+// lockInstall takes the lock that install.sh uses: a directory named
+// install.lock holding the owner's process ID. The flock in lock only excludes
+// other updates; this one also excludes the installer, which cannot use flock
+// portably. A lock whose owner has exited is taken over.
+func lockInstall(root string) (func(), error) {
+	directory := filepath.Join(root, "install.lock")
+	for attempt := 0; ; attempt++ {
+		err := os.Mkdir(directory, 0o700)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("create install lock: %w", err)
+		}
+		if attempt > 0 || !installLockStale(directory) {
+			return nil, errors.New("an Inline installation is already running")
+		}
+		if err := os.RemoveAll(directory); err != nil {
+			return nil, fmt.Errorf("remove stale install lock: %w", err)
+		}
+	}
+	release := func() { _ = os.RemoveAll(directory) }
+	if err := os.WriteFile(filepath.Join(directory, "pid"), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		release()
+		return nil, fmt.Errorf("write install lock: %w", err)
+	}
+	return release, nil
+}
+
+func installLockStale(directory string) bool {
+	contents, err := os.ReadFile(filepath.Join(directory, "pid"))
+	if err == nil {
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(contents))); err == nil && pid > 0 {
+			// EPERM means the process exists but belongs to someone else.
+			return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
+		}
+	}
+	info, err := os.Stat(directory)
+	if err != nil {
+		return false
+	}
+	return time.Since(info.ModTime()) > staleInstallLockAge
 }
 
 func fetchRelease(ctx context.Context, options Options) (release, error) {

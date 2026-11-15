@@ -67,6 +67,17 @@ type processSource interface {
 	Events() <-chan process.Event
 }
 
+// logEmptyReason says why a process's log buffer holds no lines. It is only
+// meaningful while the buffer is empty: appendLine resets it to logsNotEmptied,
+// so an empty buffer with that value has never received a line.
+type logEmptyReason int
+
+const (
+	logsNotEmptied logEmptyReason = iota
+	logsClearedByUser
+	logsEvicted
+)
+
 type processView struct {
 	definition     procfile.Process
 	viewport       viewport.Model
@@ -77,10 +88,90 @@ type processView struct {
 	generation     uint64
 	follow         bool
 	dirty          bool
-	matchCursor    int
+	pinnedMatch    matchSpan
+	hasPinnedMatch bool
 	activeMatchRow int
-	logsCleared    bool
+	emptyReason    logEmptyReason
 	maxRenderBytes int
+}
+
+// inputMode says where key and mouse input goes. Every change goes through
+// setMode, which keeps the fields that belong to a mode, and the terminal's
+// mouse reporting, in step with it:
+//
+//	modeNormal → modeFilter   /
+//	modeFilter → modeNormal   enter (keep the query), esc (restore it)
+//	modeNormal → modeView     v
+//	modeView   → modeNormal   v, esc, terminal resize
+type inputMode int
+
+const (
+	// modeNormal sends input to the app's shortcuts.
+	modeNormal inputMode = iota
+	// modeFilter sends keys to the filter input of the selected process.
+	// filterOriginal holds the query to restore on cancel.
+	modeFilter
+	// modeView freezes the screen in viewModeSnapshot and turns mouse
+	// reporting off so the terminal can select text.
+	modeView
+)
+
+// setFollow is the only place that changes follow. Following implies the
+// viewport is at the bottom, so turning it on scrolls there. After the user
+// scrolls, callers pass viewport.AtBottom(): reaching the bottom resumes
+// following and leaving it pauses. f and match navigation pass an explicit
+// value, which is how the view can be paused while at the bottom.
+//
+// follow also decides the selected match (see selectedOccurrence), so pausing
+// pins the match that was selected and resuming drops the pin.
+func (item *processView) setFollow(follow bool) {
+	if follow != item.follow {
+		if follow {
+			item.clearPinnedMatch()
+		} else {
+			span, _, ok := item.selectedOccurrence()
+			item.pinnedMatch, item.hasPinnedMatch = span, ok
+		}
+		if item.logs.normalizedQuery != "" {
+			item.dirty = true
+		}
+	}
+	item.follow = follow
+	if follow {
+		item.viewport.GotoBottom()
+	}
+}
+
+func (item *processView) clearPinnedMatch() {
+	item.pinnedMatch, item.hasPinnedMatch = matchSpan{}, false
+}
+
+// selectedOccurrence derives the selected match and its position among the
+// indexed occurrences. Nothing has to be updated when lines are appended or
+// evicted:
+//
+//	no indexed occurrences            none
+//	following, index capped           none (the newest match is not indexed)
+//	following                         the newest occurrence
+//	paused, pinned match still held   the pinned match
+//	paused otherwise                  the oldest occurrence
+func (item *processView) selectedOccurrence() (span matchSpan, index int, ok bool) {
+	occurrences := item.logs.activeOccurrences()
+	if len(occurrences) == 0 {
+		return matchSpan{}, -1, false
+	}
+	if item.follow {
+		if item.logs.occurrencesLimited() {
+			return matchSpan{}, -1, false
+		}
+		return occurrences[len(occurrences)-1], len(occurrences) - 1, true
+	}
+	if item.hasPinnedMatch {
+		if index := item.logs.occurrenceIndex(item.pinnedMatch); index >= 0 {
+			return item.pinnedMatch, index, true
+		}
+	}
+	return occurrences[0], 0, true
 }
 
 // Model is Inline's Bubble Tea application state.
@@ -97,10 +188,8 @@ type Model struct {
 	ready            bool
 	startupSpinner   spinner.Model
 	filterInput      textinput.Model
-	filterEditing    bool
-	filterProcess    int
+	mode             inputMode
 	filterOriginal   string
-	viewMode         bool
 	viewModeSnapshot string
 	nextLogArrival   uint64
 	retainedLogBytes int
@@ -127,7 +216,6 @@ func New(definitions []procfile.Process, source processSource, path, workingDire
 			state:          process.Starting,
 			follow:         true,
 			dirty:          true,
-			matchCursor:    -1,
 			activeMatchRow: -1,
 			maxRenderBytes: maxRenderedLogBytes,
 		}
@@ -141,7 +229,6 @@ func New(definitions []procfile.Process, source processSource, path, workingDire
 		version:          sanitizeDisplayText(version),
 		startupSpinner:   startupSpinner,
 		filterInput:      filterInput,
-		filterProcess:    -1,
 		maxRetainedBytes: maxTotalLogBytes,
 	}
 }
@@ -199,17 +286,15 @@ func waitForEvent(events <-chan process.Event) tea.Cmd {
 func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch message := message.(type) {
 	case tea.WindowSizeMsg:
-		wasViewMode := m.viewMode
-		m.viewMode = false
-		m.viewModeSnapshot = ""
+		var command tea.Cmd
+		if m.mode == modeView {
+			command = m.setMode(modeNormal)
+		}
 		m.width = message.Width
 		m.height = message.Height
 		m.ready = true
 		m.resize()
-		if wasViewMode {
-			return m, tea.EnableMouseCellMotion
-		}
-		return m, nil
+		return m, command
 
 	case process.Event:
 		wasStarting := m.hasStartingProcess()
@@ -243,20 +328,19 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if message.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
-		if m.viewMode {
+		switch m.mode {
+		case modeView:
 			switch message.String() {
 			case "v", "esc":
-				m.viewMode = false
-				m.viewModeSnapshot = ""
+				command := m.setMode(modeNormal)
 				m.refreshSelected()
-				return m, tea.EnableMouseCellMotion
+				return m, command
 			case "q":
 				return m, tea.Quit
 			default:
 				return m, nil
 			}
-		}
-		if m.filterEditing {
+		case modeFilter:
 			return m.updateFilterInput(message)
 		}
 
@@ -267,8 +351,8 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			item := &m.processes[m.selected]
 			item.logs.clear()
 			m.retainedLogBytes = m.totalRetainedLogBytes()
-			item.matchCursor = -1
-			item.logsCleared = true
+			item.clearPinnedMatch()
+			item.emptyReason = logsClearedByUser
 			item.dirty = true
 			m.refreshSelected()
 			return m, nil
@@ -279,15 +363,13 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				return nil
 			}
 		case "v":
-			m.viewMode = true
-			m.viewModeSnapshot = m.renderView()
-			return m, tea.DisableMouse
+			return m, m.setMode(modeView)
 		case "/":
-			return m, m.beginFilter()
+			return m, m.setMode(modeFilter)
 		case "esc":
 			item := &m.processes[m.selected]
 			if item.logs.setQuery("") {
-				item.matchCursor = -1
+				item.clearPinnedMatch()
 				item.dirty = true
 				m.refreshSelected()
 			}
@@ -316,20 +398,19 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "end", "G":
 			item := &m.processes[m.selected]
-			item.follow = true
-			item.viewport.GotoBottom()
+			item.setFollow(true)
+			m.refreshSelected()
 			return m, nil
 		case "home", "g":
 			item := &m.processes[m.selected]
-			item.follow = false
 			item.viewport.GotoTop()
+			item.setFollow(item.viewport.AtBottom())
+			m.refreshSelected()
 			return m, nil
 		case "f":
 			item := &m.processes[m.selected]
-			item.follow = !item.follow
-			if item.follow {
-				item.viewport.GotoBottom()
-			}
+			item.setFollow(!item.follow)
+			m.refreshSelected()
 			return m, nil
 		}
 
@@ -341,20 +422,15 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 
 		if isScrollKey(message.String()) {
 			item := &m.processes[m.selected]
-			item.follow = false
 			updated, command := item.viewport.Update(message)
 			item.viewport = updated
-			if item.viewport.AtBottom() {
-				item.follow = true
-			}
+			item.setFollow(item.viewport.AtBottom())
+			m.refreshSelected()
 			return m, command
 		}
 
 	case tea.MouseMsg:
-		if m.viewMode {
-			return m, nil
-		}
-		if m.filterEditing {
+		if m.mode != modeNormal {
 			return m, nil
 		}
 		if message.Action == tea.MouseActionPress && message.Button == tea.MouseButtonLeft {
@@ -367,14 +443,10 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if message.Button == tea.MouseButtonWheelUp || message.Button == tea.MouseButtonWheelDown {
 			item := &m.processes[m.selected]
-			if message.Button == tea.MouseButtonWheelUp {
-				item.follow = false
-			}
 			updated, command := item.viewport.Update(message)
 			item.viewport = updated
-			if item.viewport.AtBottom() {
-				item.follow = true
-			}
+			item.setFollow(item.viewport.AtBottom())
+			m.refreshSelected()
 			return m, command
 		}
 	}
@@ -383,7 +455,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) View() string {
-	if m.viewMode && m.viewModeSnapshot != "" {
+	if m.mode == modeView {
 		return m.viewModeSnapshot
 	}
 	return m.renderView()
@@ -444,11 +516,9 @@ func (m Model) hasStartingProcess() bool {
 
 func (m *Model) appendLine(index int, line string) {
 	item := &m.processes[index]
-	item.logsCleared = false
-	current, hadCurrent := selectedOccurrence(item)
+	item.emptyReason = logsNotEmptied
 	m.nextLogArrival++
 	if item.logs.appendWithArrival(line, m.nextLogArrival) {
-		m.reconcileMatchCursor(item, current, hadCurrent)
 		item.dirty = true
 	}
 	m.retainedLogBytes = m.totalRetainedLogBytes()
@@ -484,58 +554,80 @@ func (m *Model) enforceGlobalLogBudget() {
 		}
 
 		item := &m.processes[oldestIndex]
-		current, hadCurrent := selectedOccurrence(item)
 		entry, changed := item.logs.evictOldest()
 		m.retainedLogBytes -= entry.retainedBytes()
+		if item.logs.count() == 0 {
+			item.emptyReason = logsEvicted
+		}
 		if changed {
-			m.reconcileMatchCursor(item, current, hadCurrent)
 			item.dirty = true
 		}
 	}
 }
 
-func (m *Model) beginFilter() tea.Cmd {
-	item := &m.processes[m.selected]
-	m.filterEditing = true
-	m.filterProcess = m.selected
-	m.filterOriginal = item.logs.query
-	m.filterInput.SetValue(item.logs.query)
-	m.filterInput.CursorEnd()
-	return m.filterInput.Focus()
-}
-
-func (m *Model) updateFilterInput(message tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if m.filterProcess < 0 || m.filterProcess >= len(m.processes) {
-		m.filterEditing = false
-		m.filterProcess = -1
-		m.filterInput.Blur()
-		return *m, nil
+// setMode is the only place that changes the input mode. It tears down the
+// mode being left, sets up the one being entered, and returns the command the
+// terminal needs for the change, if any.
+func (m *Model) setMode(next inputMode) tea.Cmd {
+	if next == m.mode {
+		return nil
 	}
 
-	item := &m.processes[m.filterProcess]
+	var leave tea.Cmd
+	switch m.mode {
+	case modeFilter:
+		m.filterOriginal = ""
+		m.filterInput.Blur()
+	case modeView:
+		m.viewModeSnapshot = ""
+		leave = tea.EnableMouseCellMotion
+	}
+
+	m.mode = next
+	var enter tea.Cmd
+	switch next {
+	case modeFilter:
+		query := m.processes[m.selected].logs.query
+		m.filterOriginal = query
+		m.filterInput.SetValue(query)
+		m.filterInput.CursorEnd()
+		enter = m.filterInput.Focus()
+	case modeView:
+		// Rendered after the mode change so the snapshot shows the view-mode footer.
+		m.viewModeSnapshot = m.renderView()
+		enter = tea.DisableMouse
+	}
+
+	if leave == nil {
+		return enter
+	}
+	if enter == nil {
+		return leave
+	}
+	return tea.Sequence(leave, enter)
+}
+
+// updateFilterInput handles a key in modeFilter. Selection cannot change in
+// that mode, so the filter being edited always belongs to the selected process.
+func (m *Model) updateFilterInput(message tea.KeyMsg) (tea.Model, tea.Cmd) {
+	item := &m.processes[m.selected]
 	switch message.String() {
 	case "enter":
-		m.filterEditing = false
-		m.filterProcess = -1
-		m.filterInput.Blur()
-		return *m, nil
+		return *m, m.setMode(modeNormal)
 	case "esc":
 		if item.logs.setQuery(m.filterOriginal) {
-			m.resetMatchCursor(item)
+			item.clearPinnedMatch()
 			item.dirty = true
 			m.refreshSelected()
 			m.revealActiveMatch(item)
 		}
-		m.filterEditing = false
-		m.filterProcess = -1
-		m.filterInput.Blur()
-		return *m, nil
+		return *m, m.setMode(modeNormal)
 	}
 
 	input, command := m.filterInput.Update(message)
 	m.filterInput = input
 	if item.logs.setQuery(m.filterInput.Value()) {
-		m.resetMatchCursor(item)
+		item.clearPinnedMatch()
 		item.dirty = true
 		m.refreshSelected()
 		m.revealActiveMatch(item)
@@ -556,7 +648,8 @@ func (m *Model) refreshViewport(item *processView) {
 	}
 	entries := item.logs.visibleEntries()
 	end := len(entries)
-	if current, ok := selectedOccurrence(item); ok {
+	current, currentIndex, hasCurrent := item.selectedOccurrence()
+	if hasCurrent {
 		for index, entry := range entries {
 			if entry.sequence == current.sequence {
 				end = index + 1
@@ -581,8 +674,8 @@ func (m *Model) refreshViewport(item *processView) {
 		entry := entries[index]
 		spans, start := item.logs.occurrencesFor(entry.sequence)
 		active := -1
-		if item.matchCursor >= start && item.matchCursor < start+len(spans) {
-			active = item.matchCursor - start
+		if hasCurrent && currentIndex >= start && currentIndex < start+len(spans) {
+			active = currentIndex - start
 		}
 		line := highlightLogLine(entry.raw, spans, active)
 		wrapped := wrapLogLine(line, item.viewport.Width)
@@ -624,54 +717,6 @@ func (m *Model) refreshViewport(item *processView) {
 	}
 }
 
-func selectedOccurrence(item *processView) (matchSpan, bool) {
-	occurrences := item.logs.activeOccurrences()
-	if item.matchCursor < 0 || item.matchCursor >= len(occurrences) {
-		return matchSpan{}, false
-	}
-	return occurrences[item.matchCursor], true
-}
-
-func (m *Model) resetMatchCursor(item *processView) {
-	count := item.logs.occurrenceCount()
-	if count == 0 {
-		item.matchCursor = -1
-		return
-	}
-	if item.follow {
-		if item.logs.occurrencesLimited() {
-			item.matchCursor = -1
-			return
-		}
-		item.matchCursor = count - 1
-		return
-	}
-	item.matchCursor = 0
-}
-
-func (m *Model) reconcileMatchCursor(item *processView, current matchSpan, hadCurrent bool) {
-	count := item.logs.occurrenceCount()
-	if count == 0 {
-		item.matchCursor = -1
-		return
-	}
-	if item.follow {
-		if item.logs.occurrencesLimited() {
-			item.matchCursor = -1
-			return
-		}
-		item.matchCursor = count - 1
-		return
-	}
-	if hadCurrent {
-		if index := item.logs.occurrenceIndex(current); index >= 0 {
-			item.matchCursor = index
-			return
-		}
-	}
-	item.matchCursor = min(max(item.matchCursor, 0), count-1)
-}
-
 func (m *Model) navigateMatch(delta int) {
 	if len(m.processes) == 0 {
 		return
@@ -681,12 +726,12 @@ func (m *Model) navigateMatch(delta int) {
 	if item.logs.normalizedQuery == "" || count == 0 {
 		return
 	}
-	if item.matchCursor < 0 || item.matchCursor >= count {
-		item.matchCursor = 0
-	} else {
-		item.matchCursor = (item.matchCursor + delta + count) % count
+	next := 0
+	if _, index, ok := item.selectedOccurrence(); ok {
+		next = (index + delta + count) % count
 	}
-	item.follow = false
+	item.setFollow(false)
+	item.pinnedMatch, item.hasPinnedMatch = item.logs.activeOccurrences()[next], true
 	item.dirty = true
 	m.refreshSelected()
 	m.revealActiveMatch(item)
@@ -979,7 +1024,7 @@ func (m Model) renderPanel() string {
 	innerWidth := max(1, mainWidth-4)
 	command := commandStyle.Render(truncate("$ "+item.definition.Command, innerWidth))
 	status := renderStatus(item, innerWidth)
-	if m.filterEditing && m.filterProcess == m.selected {
+	if m.mode == modeFilter {
 		status = m.filterInput.View()
 	}
 	divider := mutedStyle.Render(strings.Repeat("─", innerWidth))
@@ -998,7 +1043,7 @@ func renderStatus(item processView, width int) string {
 	} else {
 		label += fmt.Sprintf(" · %d lines", item.logs.count())
 	}
-	if item.state == process.Running && item.logs.count() == 0 {
+	if item.state == process.Running && item.logs.count() == 0 && item.emptyReason != logsEvicted {
 		label += " · waiting for output"
 	}
 	return style.Render(truncate(label, width))
@@ -1019,26 +1064,26 @@ func renderLogs(item processView) string {
 			Height(item.viewport.Height).
 			Render(fmt.Sprintf("No lines match %q. %s retained.", item.logs.query, retained))
 	}
-	if item.logsCleared {
-		return lipgloss.NewStyle().
-			Foreground(colorMuted).
-			Width(item.viewport.Width).
-			Height(item.viewport.Height).
-			Render("Inline cleared the logs. New output will appear here.")
+	message := "No output yet. The process has not written to stdout or stderr."
+	switch item.emptyReason {
+	case logsClearedByUser:
+		message = "Inline cleared the logs. New output will appear here."
+	case logsEvicted:
+		message = "Inline dropped this process's earlier output to stay within the log memory limit. New output will appear here."
 	}
 	return lipgloss.NewStyle().
 		Foreground(colorMuted).
 		Width(item.viewport.Width).
 		Height(item.viewport.Height).
-		Render("No output yet. The process has not written to stdout or stderr.")
+		Render(message)
 }
 
 func (m Model) renderFooter() string {
 	item := m.processes[m.selected]
-	if m.viewMode {
+	if m.mode == modeView {
 		return m.renderFooterParts(" drag to select · use terminal copy shortcut · v/esc exit", m.version+" · view mode ")
 	}
-	if m.filterEditing {
+	if m.mode == modeFilter {
 		return m.renderFooterParts(" type to filter · enter apply · esc cancel", "filtering ")
 	}
 	mode := "paused"
@@ -1049,8 +1094,8 @@ func (m Model) renderFooter() string {
 	left := " ↑/↓ select · r restart · c clear · / filter · pgup/dn · f follow · v view · q quit"
 	if item.logs.normalizedQuery != "" {
 		current := 0
-		if item.matchCursor >= 0 && item.matchCursor < item.logs.occurrenceCount() {
-			current = item.matchCursor + 1
+		if _, index, ok := item.selectedOccurrence(); ok {
+			current = index + 1
 		}
 		if item.logs.occurrencesLimited() {
 			left = fmt.Sprintf(" [%d/%d indexed · %d total] matches · navigation limited · c clear · n/N move · esc clear filter", current, item.logs.occurrenceCount(), item.logs.totalOccurrenceCount())

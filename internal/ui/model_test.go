@@ -33,6 +33,13 @@ func newTestModel() Model {
 	return New(definitions, &fakeSource{events: make(chan process.Event)}, "Procfile", "/Users/example/project", "main", "v1.2.3")
 }
 
+// matchIndex is the selected match's position among the indexed occurrences,
+// or -1 when no match is selected.
+func matchIndex(item *processView) int {
+	_, index, _ := item.selectedOccurrence()
+	return index
+}
+
 func TestProcessNavigation(t *testing.T) {
 	model := newTestModel()
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyDown})
@@ -85,7 +92,6 @@ func TestClearKeyClearsOnlySelectedProcessLogs(t *testing.T) {
 	}
 	item := &model.processes[0]
 	item.logs.setQuery("error")
-	model.resetMatchCursor(item)
 	item.follow = false
 	item.dirty = true
 	model.refreshSelected()
@@ -103,8 +109,8 @@ func TestClearKeyClearsOnlySelectedProcessLogs(t *testing.T) {
 	if item.logs.query != "error" {
 		t.Fatalf("filter after clear = %q, want error", item.logs.query)
 	}
-	if item.matchCursor != -1 || item.logs.occurrenceCount() != 0 {
-		t.Fatalf("match state after clear = cursor %d with %d occurrences, want -1 with 0", item.matchCursor, item.logs.occurrenceCount())
+	if index := matchIndex(item); index != -1 || item.logs.occurrenceCount() != 0 {
+		t.Fatalf("match state after clear = cursor %d with %d occurrences, want -1 with 0", index, item.logs.occurrenceCount())
 	}
 	if item.follow {
 		t.Fatal("clear key resumed log following")
@@ -124,7 +130,7 @@ func TestClearKeyClearsOnlySelectedProcessLogs(t *testing.T) {
 	if got, want := model.processes[0].logs.visibleLines(), []string{"new web error"}; !slices.Equal(got, want) {
 		t.Fatalf("selected process lines after new output = %v, want %v", got, want)
 	}
-	if model.processes[0].logsCleared {
+	if model.processes[0].emptyReason != logsNotEmptied {
 		t.Fatal("selected process remains marked as cleared after new output")
 	}
 }
@@ -368,7 +374,7 @@ func TestEscapeCancelsFilterEdit(t *testing.T) {
 	if got := model.processes[0].logs.query; got != "error" {
 		t.Fatalf("query after cancel = %q, want error", got)
 	}
-	if model.filterEditing {
+	if model.mode != modeNormal {
 		t.Fatal("filter remains in editing mode after escape")
 	}
 }
@@ -410,6 +416,43 @@ func TestModelEvictsOldestEntryAcrossProcessesAtGlobalBudget(t *testing.T) {
 	}
 }
 
+func TestEvictedLogsDoNotClaimProcessNeverWrote(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	model = updated.(Model)
+	model.maxRetainedBytes = 200
+	model.applyEvent(process.Event{Index: 0, State: process.Running, PID: 1234, Line: "web ready"})
+	for range 50 {
+		model.applyEvent(process.Event{Index: 1, Line: "worker tick"})
+	}
+
+	item := model.processes[0]
+	if item.logs.count() != 0 {
+		t.Fatalf("first process retains %d lines, want all evicted", item.logs.count())
+	}
+	if item.emptyReason != logsEvicted {
+		t.Fatalf("empty reason = %d, want logsEvicted", item.emptyReason)
+	}
+	view := ansi.Strip(model.View())
+	if strings.Contains(view, "No output yet") || strings.Contains(view, "waiting for output") {
+		t.Fatalf("view claims the process never wrote:\n%s", view)
+	}
+	if !strings.Contains(view, "dropped this process's earlier output") {
+		t.Fatalf("view does not explain the eviction:\n%s", view)
+	}
+
+	model.applyEvent(process.Event{Index: 0, Line: "web again"})
+	if got := model.processes[0].emptyReason; got != logsNotEmptied {
+		t.Fatalf("empty reason after new output = %d, want logsNotEmptied", got)
+	}
+
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	model = updated.(Model)
+	if got := model.processes[0].emptyReason; got != logsClearedByUser {
+		t.Fatalf("empty reason after clear = %d, want logsClearedByUser", got)
+	}
+}
+
 func TestViewportContentIsBounded(t *testing.T) {
 	model := newTestModel()
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
@@ -434,7 +477,6 @@ func TestFooterReportsLimitedMatchNavigation(t *testing.T) {
 	model.width = 300
 	model.processes[0].logs.setQuery("a")
 	model.processes[0].logs.append(strings.Repeat("a", maxIndexedOccurrences+1))
-	model.resetMatchCursor(&model.processes[0])
 
 	footer := ansi.Strip(model.renderFooter())
 	if !strings.Contains(footer, "10000 indexed · 10001 total") || !strings.Contains(footer, "navigation limited") {
@@ -484,6 +526,40 @@ func TestHighlightRestoresOriginalBackground(t *testing.T) {
 	}
 }
 
+func TestHomeKeyPausesOnlyWhenThereIsOutputBelow(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 60, Height: 12})
+	model = updated.(Model)
+	updated, _ = model.Update(process.Event{Index: 0, Line: "only line"})
+	model = updated.(Model)
+
+	updated, _ = model.Update(keyRunes("g"))
+	model = updated.(Model)
+	if !model.processes[0].follow {
+		t.Fatal("g paused following although all output fits on screen")
+	}
+
+	for index := range 40 {
+		updated, _ = model.Update(process.Event{Index: 0, Line: fmt.Sprintf("line %02d", index)})
+		model = updated.(Model)
+	}
+	if !model.processes[0].viewport.AtBottom() {
+		t.Fatal("viewport stopped following new output after g")
+	}
+
+	updated, _ = model.Update(keyRunes("g"))
+	model = updated.(Model)
+	if item := model.processes[0]; item.follow || item.viewport.YOffset != 0 {
+		t.Fatalf("g with output below: follow=%v offset=%d, want paused at the top", item.follow, item.viewport.YOffset)
+	}
+
+	updated, _ = model.Update(keyRunes("G"))
+	model = updated.(Model)
+	if item := model.processes[0]; !item.follow || !item.viewport.AtBottom() {
+		t.Fatalf("G: follow=%v atBottom=%v, want following at the bottom", item.follow, item.viewport.AtBottom())
+	}
+}
+
 func TestMatchNavigationWrapsAndRevealsCurrentOccurrence(t *testing.T) {
 	model := newTestModel()
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 60, Height: 12})
@@ -499,7 +575,7 @@ func TestMatchNavigationWrapsAndRevealsCurrentOccurrence(t *testing.T) {
 	model = updated.(Model)
 	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated.(Model)
-	if got := model.processes[0].matchCursor; got != 11 {
+	if got := matchIndex(&model.processes[0]); got != 11 {
 		t.Fatalf("initial match cursor = %d, want 11", got)
 	}
 	if !strings.Contains(ansi.Strip(model.renderFooter()), "[12/12] matches") {
@@ -509,15 +585,15 @@ func TestMatchNavigationWrapsAndRevealsCurrentOccurrence(t *testing.T) {
 	updated, _ = model.Update(keyRunes("n"))
 	model = updated.(Model)
 	item := model.processes[0]
-	if item.matchCursor != 0 || item.follow || item.viewport.YOffset != 0 {
-		t.Fatalf("next did not wrap to the first match: cursor=%d follow=%v offset=%d", item.matchCursor, item.follow, item.viewport.YOffset)
+	if matchIndex(&item) != 0 || item.follow || item.viewport.YOffset != 0 {
+		t.Fatalf("next did not wrap to the first match: cursor=%d follow=%v offset=%d", matchIndex(&item), item.follow, item.viewport.YOffset)
 	}
 
 	updated, _ = model.Update(keyRunes("N"))
 	model = updated.(Model)
 	item = model.processes[0]
-	if item.matchCursor != 11 {
-		t.Fatalf("previous cursor = %d, want 11", item.matchCursor)
+	if matchIndex(&item) != 11 {
+		t.Fatalf("previous cursor = %d, want 11", matchIndex(&item))
 	}
 	if item.activeMatchRow < item.viewport.YOffset || item.activeMatchRow >= item.viewport.YOffset+item.viewport.Height {
 		t.Fatalf("current match row %d is outside viewport [%d,%d)", item.activeMatchRow, item.viewport.YOffset, item.viewport.YOffset+item.viewport.Height)
@@ -531,7 +607,6 @@ func TestMatchNavigationMovesBetweenOccurrencesOnOneLine(t *testing.T) {
 	updated, _ = model.Update(process.Event{Index: 0, Line: "error then error"})
 	model = updated.(Model)
 	model.processes[0].logs.setQuery("error")
-	model.resetMatchCursor(&model.processes[0])
 	model.processes[0].dirty = true
 	model.refreshSelected()
 
@@ -554,7 +629,6 @@ func TestCurrentMatchRowTracksWrappedOutput(t *testing.T) {
 	updated, _ = model.Update(process.Event{Index: 0, Line: strings.Repeat("prefix ", 20) + "error"})
 	model = updated.(Model)
 	model.processes[0].logs.setQuery("error")
-	model.resetMatchCursor(&model.processes[0])
 	model.processes[0].dirty = true
 	model.refreshSelected()
 
@@ -576,20 +650,93 @@ func TestPausedMatchSelectionSurvivesIncomingMatches(t *testing.T) {
 		model = updated.(Model)
 	}
 	model.processes[0].logs.setQuery("error")
-	model.resetMatchCursor(&model.processes[0])
 	model.processes[0].dirty = true
 	model.refreshSelected()
 
 	updated, _ = model.Update(keyRunes("n"))
 	model = updated.(Model)
-	selected, ok := selectedOccurrence(&model.processes[0])
+	selected, _, ok := model.processes[0].selectedOccurrence()
 	if !ok {
 		t.Fatal("no match selected after navigation")
 	}
 	updated, _ = model.Update(process.Event{Index: 0, Line: "third error"})
 	model = updated.(Model)
-	if current, ok := selectedOccurrence(&model.processes[0]); !ok || current != selected {
+	if current, _, ok := model.processes[0].selectedOccurrence(); !ok || current != selected {
 		t.Fatalf("incoming match changed paused selection from %#v to %#v", selected, current)
+	}
+}
+
+func TestPausingPinsSelectedMatchAndResumingSelectsNewest(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	model = updated.(Model)
+	for _, line := range []string{"first error", "second error"} {
+		updated, _ = model.Update(process.Event{Index: 0, Line: line})
+		model = updated.(Model)
+	}
+	model.processes[0].logs.setQuery("error")
+	model.processes[0].dirty = true
+	model.refreshSelected()
+	if got := matchIndex(&model.processes[0]); got != 1 {
+		t.Fatalf("selected match while following = %d, want the newest (1)", got)
+	}
+
+	updated, _ = model.Update(keyRunes("f"))
+	model = updated.(Model)
+	updated, _ = model.Update(process.Event{Index: 0, Line: "third error"})
+	model = updated.(Model)
+	if model.processes[0].follow {
+		t.Fatal("f did not pause following")
+	}
+	if got := matchIndex(&model.processes[0]); got != 1 {
+		t.Fatalf("selected match after pausing and new output = %d, want it pinned at 1", got)
+	}
+	if footer := ansi.Strip(model.renderFooter()); !strings.Contains(footer, "[2/3] matches") {
+		t.Fatalf("footer does not show the pinned match: %q", footer)
+	}
+
+	updated, _ = model.Update(keyRunes("f"))
+	model = updated.(Model)
+	if got := matchIndex(&model.processes[0]); got != 2 {
+		t.Fatalf("selected match after resuming = %d, want the newest (2)", got)
+	}
+	last := model.processes[0].rendered[len(model.processes[0].rendered)-1]
+	if !strings.Contains(ansi.Strip(last), "third error") || !strings.Contains(last, matchHighlightSequence(true)) {
+		t.Fatalf("newest match is not rendered as current after resuming: %q", last)
+	}
+}
+
+func TestEvictingPinnedMatchSelectsOldestRemaining(t *testing.T) {
+	model := newTestModel()
+	updated, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	model = updated.(Model)
+	for _, line := range []string{"error one", "error two", "error three"} {
+		updated, _ = model.Update(process.Event{Index: 0, Line: line})
+		model = updated.(Model)
+	}
+	model.processes[0].logs.setQuery("error")
+	model.processes[0].dirty = true
+	model.refreshSelected()
+	updated, _ = model.Update(keyRunes("n"))
+	model = updated.(Model)
+	pinned, index, ok := model.processes[0].selectedOccurrence()
+	if !ok || index != 0 {
+		t.Fatalf("selection after wrapping = index %d ok=%v, want the oldest match", index, ok)
+	}
+
+	model.maxRetainedBytes = model.retainedLogBytes - 1
+	model.enforceGlobalLogBudget()
+	model.refreshSelected()
+
+	current, index, ok := model.processes[0].selectedOccurrence()
+	if !ok || index != 0 || current == pinned {
+		t.Fatalf("selection after eviction = %#v index %d ok=%v, want the oldest remaining match", current, index, ok)
+	}
+	if entry, found := model.processes[0].logs.entry(current.sequence); !found || entry.raw != "error two" {
+		t.Fatalf("selected line after eviction = %q, want error two", entry.raw)
+	}
+	if model.processes[0].follow {
+		t.Fatal("eviction resumed following")
 	}
 }
 
@@ -674,7 +821,7 @@ func TestViewModeFreezesOutputAndRestoresLatestLogsOnExit(t *testing.T) {
 
 	updated, command := model.Update(keyRunes("v"))
 	model = updated.(Model)
-	if !model.viewMode {
+	if model.mode != modeView {
 		t.Fatal("view mode is disabled after pressing v")
 	}
 	if command == nil || reflect.TypeOf(command()) != reflect.TypeOf(tea.DisableMouse()) {
@@ -698,7 +845,7 @@ func TestViewModeFreezesOutputAndRestoresLatestLogsOnExit(t *testing.T) {
 
 	updated, command = model.Update(keyRunes("v"))
 	model = updated.(Model)
-	if model.viewMode {
+	if model.mode != modeNormal {
 		t.Fatal("view mode is still enabled after pressing v again")
 	}
 	if command == nil || reflect.TypeOf(command()) != reflect.TypeOf(tea.EnableMouseCellMotion()) {
@@ -752,7 +899,7 @@ func TestEscapeLeavesViewMode(t *testing.T) {
 
 	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	model = updated.(Model)
-	if model.viewMode {
+	if model.mode != modeNormal {
 		t.Fatal("escape did not leave view mode")
 	}
 	if command == nil || reflect.TypeOf(command()) != reflect.TypeOf(tea.EnableMouseCellMotion()) {
@@ -769,7 +916,7 @@ func TestResizeLeavesViewMode(t *testing.T) {
 
 	updated, command := model.Update(tea.WindowSizeMsg{Width: 90, Height: 25})
 	model = updated.(Model)
-	if model.viewMode || model.viewModeSnapshot != "" {
+	if model.mode != modeNormal || model.viewModeSnapshot != "" {
 		t.Fatal("resize did not clear view mode")
 	}
 	if command == nil || reflect.TypeOf(command()) != reflect.TypeOf(tea.EnableMouseCellMotion()) {

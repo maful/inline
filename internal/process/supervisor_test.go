@@ -5,7 +5,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -223,41 +222,255 @@ func TestRestartReplacesSelectedProcess(t *testing.T) {
 		otherPID = otherItem.command.Process.Pid
 	}
 	otherGeneration := otherItem.generation
-	otherRunning := otherItem.running
+	otherState := otherItem.state
 	otherItem.mu.Unlock()
-	if !otherRunning || otherPID != other.PID || otherGeneration != 1 {
-		t.Fatalf("other process changed: running=%t, pid=%d, generation=%d", otherRunning, otherPID, otherGeneration)
+	if otherState != Running || otherPID != other.PID || otherGeneration != 1 {
+		t.Fatalf("other process changed: state=%q, pid=%d, generation=%d", otherState, otherPID, otherGeneration)
 	}
 }
 
-func TestConcurrentRestartsAreSerialized(t *testing.T) {
+func TestSupervisorStoresLifecycleState(t *testing.T) {
+	const loop = "trap 'exit 0' TERM; while :; do sleep 1; done"
+	supervisor := newSupervisor([]procfile.Process{
+		{Name: "long", Command: loop},
+		{Name: "clean", Command: "exit 0"},
+		{Name: "broken", Command: "exit 3"},
+	}, "/bin/sh", false)
+
+	for index := range supervisor.processes {
+		assertStoredState(t, supervisor, index, notStarted, 0)
+	}
+
+	supervisor.StartAll()
+	t.Cleanup(supervisor.StopAll)
+	pending := map[int]State{0: Running, 1: Exited, 2: Failed}
+	waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
+		if pending[event.Index] == event.State {
+			delete(pending, event.Index)
+		}
+		return len(pending) == 0
+	})
+	assertStoredState(t, supervisor, 0, Running, 1)
+	assertStoredState(t, supervisor, 1, Exited, 1)
+	assertStoredState(t, supervisor, 2, Failed, 1)
+
+	supervisor.Restart(0)
+	assertStoredState(t, supervisor, 0, Running, 2)
+
+	supervisor.StopAll()
+	assertStoredState(t, supervisor, 0, Exited, 2)
+}
+
+func TestSupervisorStoresFailedStateWhenStartFails(t *testing.T) {
+	supervisor := newSupervisor(
+		[]procfile.Process{{Name: "missing", Command: "true"}},
+		filepath.Join(t.TempDir(), "no-such-shell"),
+		false,
+	)
+	supervisor.StartAll()
+	t.Cleanup(supervisor.StopAll)
+
+	failed := waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
+		return event.State == Failed
+	})
+	if failed.Err == nil {
+		t.Fatal("failed start event has no error")
+	}
+	assertStoredState(t, supervisor, 0, Failed, 1)
+}
+
+func TestStartAllLeavesLiveProcessAlone(t *testing.T) {
 	supervisor := newSupervisor([]procfile.Process{
 		{Name: "long", Command: "trap 'exit 0' TERM; while :; do sleep 1; done"},
 	}, "/bin/sh", false)
 	supervisor.StartAll()
 	t.Cleanup(supervisor.StopAll)
-	waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
-		return event.State == Running && event.Generation == 1
+	running := waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
+		return event.State == Running
 	})
 
-	var restarts sync.WaitGroup
-	restarts.Add(2)
-	for range 2 {
-		go func() {
-			defer restarts.Done()
-			supervisor.Restart(0)
-		}()
+	supervisor.StartAll()
+
+	assertStoredState(t, supervisor, 0, Running, 1)
+	item := &supervisor.processes[0]
+	item.mu.Lock()
+	pid := item.command.Process.Pid
+	item.mu.Unlock()
+	if pid != running.PID {
+		t.Fatalf("stored pid after second StartAll = %d, want the original %d", pid, running.PID)
 	}
-	restarts.Wait()
+	select {
+	case event := <-supervisor.Events():
+		t.Fatalf("second StartAll emitted %+v, want no event", event)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
 
-	final := waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
-		if event.State == Failed {
-			t.Fatalf("concurrent restart emitted failed state: %v", event.Err)
-		}
-		return event.State == Running && event.Generation == 3
+// assertStoredState checks the supervisor's own record, including the
+// invariant that command and done exist exactly while a process is live.
+func assertStoredState(t *testing.T, supervisor *Supervisor, index int, want State, wantGeneration uint64) {
+	t.Helper()
+	item := &supervisor.processes[index]
+	item.mu.Lock()
+	state := item.state
+	generation := item.generation
+	hasCommand := item.command != nil
+	hasDone := item.done != nil
+	item.mu.Unlock()
+
+	if state != want || generation != wantGeneration {
+		t.Fatalf("process %d: state=%q generation=%d, want %q generation %d", index, state, generation, want, wantGeneration)
+	}
+	live := want == Starting || want.alive()
+	if hasCommand != live || hasDone != live {
+		t.Fatalf("process %d in state %q: command set=%t, done set=%t, want both %t", index, state, hasCommand, hasDone, live)
+	}
+}
+
+func TestRestartDuringRestartIsDropped(t *testing.T) {
+	supervisor := newSupervisor([]procfile.Process{
+		{Name: "slow-stop", Command: "trap 'sleep 0.3; exit 0' TERM; echo ready; while :; do sleep 1; done"},
+	}, "/bin/sh", false)
+	supervisor.StartAll()
+	t.Cleanup(supervisor.StopAll)
+	// Wait for the trap to be installed so the stop takes its full 0.3s.
+	waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
+		return event.Generation == 1 && event.Line == "ready"
 	})
-	if final.PID <= 0 {
-		t.Fatalf("final PID = %d, want a positive PID", final.PID)
+
+	first := make(chan struct{})
+	go func() {
+		defer close(first)
+		supervisor.Restart(0)
+	}()
+	waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
+		return event.State == Stopping
+	})
+
+	started := time.Now()
+	supervisor.Restart(0)
+	supervisor.Restart(0)
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("restarts during a restart took %s, want an immediate return", elapsed)
+	}
+
+	<-first
+	assertStoredState(t, supervisor, 0, Running, 2)
+	restartLines := 0
+	for drained := false; !drained; {
+		select {
+		case event := <-supervisor.Events():
+			if event.State == Failed {
+				t.Fatalf("restart emitted failed state: %v", event.Err)
+			}
+			if event.Line == "inline: restarting…" {
+				restartLines++
+			}
+		case <-time.After(100 * time.Millisecond):
+			drained = true
+		}
+	}
+	if restartLines != 1 {
+		t.Fatalf("restart lines = %d, want 1", restartLines)
+	}
+	assertStoredState(t, supervisor, 0, Running, 2)
+}
+
+func TestStopAllReturnsWhenRestartIsBlockedOnFullEventQueue(t *testing.T) {
+	supervisor := newSupervisor([]procfile.Process{{Name: "chatty", Command: "yes"}}, "/bin/sh", false)
+	supervisor.StartAll()
+
+	// Nothing reads Events(), as after the UI has quit, so output fills it.
+	deadline := time.Now().Add(3 * time.Second)
+	for len(supervisor.events) < cap(supervisor.events) {
+		if time.Now().After(deadline) {
+			t.Fatal("event queue did not fill")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	item := &supervisor.processes[0]
+	item.mu.Lock()
+	pid := item.command.Process.Pid
+	item.mu.Unlock()
+	t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL) })
+
+	// The restart holds the lifecycle lock while it reports Stopping.
+	go supervisor.Restart(0)
+	for {
+		item.mu.Lock()
+		state := item.state
+		item.mu.Unlock()
+		if state == Stopping {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("restart did not begin stopping the process")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		supervisor.StopAll()
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StopAll hung behind a restart blocked on the full event queue")
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for syscall.Kill(-pid, 0) != syscall.ESRCH {
+		if time.Now().After(deadline) {
+			t.Fatalf("process group %d is still running after StopAll", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestStopAllAbortsStartBlockedOnFullEventQueue(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "spawned")
+	supervisor := newSupervisor([]procfile.Process{{Name: "late", Command: "touch " + marker + "; sleep 5"}}, "/bin/sh", false)
+	for range cap(supervisor.events) {
+		supervisor.events <- Event{Line: "backlog"}
+	}
+
+	started := make(chan struct{})
+	go func() {
+		defer close(started)
+		supervisor.StartAll()
+	}()
+	item := &supervisor.processes[0]
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		item.mu.Lock()
+		state := item.state
+		item.mu.Unlock()
+		if state == Starting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("start did not reach Starting")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		supervisor.StopAll()
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StopAll hung behind a start blocked on the full event queue")
+	}
+	<-started
+
+	assertStoredState(t, supervisor, 0, Failed, 1)
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("command was spawned after shutdown began: stat = %v", err)
 	}
 }
 
