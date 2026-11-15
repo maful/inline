@@ -5,7 +5,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -328,35 +327,53 @@ func assertStoredState(t *testing.T, supervisor *Supervisor, index int, want Sta
 	}
 }
 
-func TestConcurrentRestartsAreSerialized(t *testing.T) {
+func TestRestartDuringRestartIsDropped(t *testing.T) {
 	supervisor := newSupervisor([]procfile.Process{
-		{Name: "long", Command: "trap 'exit 0' TERM; while :; do sleep 1; done"},
+		{Name: "slow-stop", Command: "trap 'sleep 0.3; exit 0' TERM; echo ready; while :; do sleep 1; done"},
 	}, "/bin/sh", false)
 	supervisor.StartAll()
 	t.Cleanup(supervisor.StopAll)
+	// Wait for the trap to be installed so the stop takes its full 0.3s.
 	waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
-		return event.State == Running && event.Generation == 1
+		return event.Generation == 1 && event.Line == "ready"
 	})
 
-	var restarts sync.WaitGroup
-	restarts.Add(2)
-	for range 2 {
-		go func() {
-			defer restarts.Done()
-			supervisor.Restart(0)
-		}()
-	}
-	restarts.Wait()
+	first := make(chan struct{})
+	go func() {
+		defer close(first)
+		supervisor.Restart(0)
+	}()
+	waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
+		return event.State == Stopping
+	})
 
-	final := waitForProcessEvent(t, supervisor.Events(), func(event Event) bool {
-		if event.State == Failed {
-			t.Fatalf("concurrent restart emitted failed state: %v", event.Err)
+	started := time.Now()
+	supervisor.Restart(0)
+	supervisor.Restart(0)
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("restarts during a restart took %s, want an immediate return", elapsed)
+	}
+
+	<-first
+	assertStoredState(t, supervisor, 0, Running, 2)
+	restartLines := 0
+	for drained := false; !drained; {
+		select {
+		case event := <-supervisor.Events():
+			if event.State == Failed {
+				t.Fatalf("restart emitted failed state: %v", event.Err)
+			}
+			if event.Line == "inline: restarting…" {
+				restartLines++
+			}
+		case <-time.After(100 * time.Millisecond):
+			drained = true
 		}
-		return event.State == Running && event.Generation == 3
-	})
-	if final.PID <= 0 {
-		t.Fatalf("final PID = %d, want a positive PID", final.PID)
 	}
+	if restartLines != 1 {
+		t.Fatalf("restart lines = %d, want 1", restartLines)
+	}
+	assertStoredState(t, supervisor, 0, Running, 2)
 }
 
 func TestRestartStartsExitedProcess(t *testing.T) {

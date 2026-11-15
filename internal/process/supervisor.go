@@ -119,13 +119,17 @@ func (s *Supervisor) StartAll() {
 }
 
 // Restart stops and starts one Procfile command while leaving the others alone.
+// A call that arrives while a start, restart, or shutdown of the same command
+// is in flight is dropped, so repeated requests merge into one restart.
 func (s *Supervisor) Restart(index int) {
 	if index < 0 || index >= len(s.processes) {
 		return
 	}
 
 	item := &s.processes[index]
-	item.lifecycle.Lock()
+	if !item.lifecycle.TryLock() {
+		return
+	}
 	defer item.lifecycle.Unlock()
 	if s.isStopping() {
 		return
